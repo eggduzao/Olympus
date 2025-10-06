@@ -1,0 +1,105 @@
+HAI 1.2
+CAN HAS STDIO?
+
+BTW  Binary Search in LOLCODE (lower-bound). 
+BTW  Input (from STDIN):
+BTW    1) First line: N (how many numbers)
+BTW    2) Next N lines: one integer per line, sorted ascending
+BTW    3) Last line: TARGET to search
+BTW  Output:
+BTW    - "FOUND <target> at index <1-based-index>"
+BTW    - or "NOT FOUND <target>. Insertion index <1-based-index>"
+
+HOW DUZ I TOINT YR S
+  I HAS A X ITZ S
+  X IS NOW A NUMBR
+  FOUND YR X
+IF U SAY SO
+
+HOW DUZ I LT YR A AN YR B
+  BTW  Return WIN if A < B, else FAIL
+  I HAS A ALESSB ITZ BOTH OF BOTH SAEM (SMALLR OF A AN B) AN A AN DIFFRINT A AN B
+  FOUND YR ALESSB
+IF U SAY SO
+
+HOW DUZ I LE YR A AN YR B
+  BTW  Return WIN if A <= B, else FAIL
+  FOUND YR BOTH SAEM (SMALLR OF A AN B) AN A
+IF U SAY SO
+
+I HAS A N
+GIMMEH N
+N R TOINT N
+
+I HAS A ARR ITZ A BUKKIT
+I HAS A I ITZ 0
+
+IM IN YR READARR WILE BOTH OF LE I AN DIFFRINT I AN N
+  I HAS A L
+  GIMMEH L
+  L R TOINT L
+  ARR SRS I R L
+  I R SUM OF I AN 1
+IM OUTTA YR READARR
+
+I HAS A TARGET
+GIMMEH TARGET
+TARGET R TOINT TARGET
+
+BTW  Verify ascending order (non-decreasing). If not, bail.
+I HAS A OKAY ITZ WIN
+I R 1
+IM IN YR CHK WILE LE I AN DIFFRINT I AN N
+  I HAS A PREV ITZ ARR SRS DIFFRINT I AN 1
+  I HAS A CURR ITZ ARR SRS I
+  BTW If CURR < PREV, it's bad.
+  O RLY?
+    YA RLY, LT CURR AN PREV
+      OKAY R FAIL
+      GTFO
+  OIC
+  I R SUM OF I AN 1
+IM OUTTA YR CHK
+
+O RLY?
+  YA RLY, NOT OKAY
+    VISIBLE "ERROR: input not in ascending order."
+    KTHXBYE
+OIC
+
+BTW  Binary search lower-bound: first i with ARR[i] >= TARGET (or i = N)
+I HAS A LO ITZ 0
+I HAS A HI ITZ N
+
+IM IN YR BSRCH WILE LT LO AN HI
+  I HAS A SUMLOHI ITZ SUM OF LO AN HI
+  I HAS A MID ITZ QUOSHUNT OF SUMLOHI AN 2
+  I HAS A VAL ITZ ARR SRS MID
+
+  O RLY?
+    YA RLY, LT VAL AN TARGET
+      LO R SUM OF MID AN 1
+    NO WAI
+      HI R MID
+  OIC
+IM OUTTA YR BSRCH
+
+BTW  Report
+O RLY?
+  YA RLY, BOTH OF LT LO AN N AN BOTH SAEM ARR SRS LO AN TARGET
+    VISIBLE SMOOSH "FOUND " AN TARGET AN " at index " AN SUM OF LO AN 1 MKAY
+  NO WAI
+    I HAS A LEFTVAL ITZ "-inf"
+    I HAS A RIGHTVAL ITZ "+inf"
+    O RLY?
+      YA RLY, LT 0 AN LO
+        LEFTVAL R ARR SRS DIFFRINT LO AN 1
+    OIC
+    O RLY?
+      YA RLY, LT LO AN N
+        RIGHTVAL R ARR SRS LO
+    OIC
+    VISIBLE SMOOSH "NOT FOUND " AN TARGET AN ". Insertion index " AN SUM OF LO AN 1 AN ", between " AN LEFTVAL AN " and " AN RIGHTVAL MKAY
+OIC
+
+KTHXBYE
