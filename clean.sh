@@ -1,5 +1,13 @@
 #!/bin/bash
 
+x=()
+y=0
+if [[ $x && $y ]]; then
+    echo "A"
+else
+    echo "B"
+fi
+
 # Message
 echo "Cleaning system-specific artifacts..."
 
