@@ -1,31 +1,64 @@
 #!/bin/bash
+# Clean Python project artifacts and OS cruft (safe-ish).
+# Usage: DRY_RUN=1 ./clean.sh  # to preview
 
-# Message
-echo "Cleaning system-specific artifacts..."
+set -euo pipefail
 
-# Removendo os arquivos .DS_Store recursivamente.
-find . -name ".DS_Store" -type f -delete
+echo "✨ Cleaning up Python project clutter... ✨"
+DRY_RUN="${DRY_RUN:-0}"
 
-# Removendo qualquer outro arquivo de metadados do MAC (arquivos que começam com "._") recursivamente.
-find . -name "._*" -type f -delete
+rmrf() {
+  if [[ "$DRY_RUN" == "1" ]]; then
+    printf '🧹 (dry-run) %s\n' "$*"
+  else
+    printf '🧹 %s\n' "$*"
+    rm -rf "$@"
+  fi
+}
 
-# Removendo .Trashes and outros que, às vezes, o MAC gera, quando quer.
-find . -name ".Trashes" -type d -exec rm -rf {} +
+# Helpers to run find safely (skip .git)
+FIND_ROOT="."
+SKIP_GIT='-not -path "./.git/*"'
 
-# Message
-echo "Cleaning Python build artifacts..."
+# Python bytecode & caches
+find "$FIND_ROOT" $SKIP_GIT -type d -name "__pycache__" -prune -exec bash -c 'rmrf "$@"' _ {} + 2>/dev/null
+find "$FIND_ROOT" $SKIP_GIT -type f \( -name "*.py[co]" -o -name "*.pyd" \) -print -delete
 
-# Remove build directories
-rm -rf build/ dist/ *.egg-info/ .eggs/
+# build/dist/egg-info
+for d in ./build ./dist ./docs/_build ./__pypackages__ ./pip-wheel-metadata; do
+  [[ -e "$d" ]] && rmrf "$d"
+done
+find "$FIND_ROOT" $SKIP_GIT -type d -name "*.egg-info" -prune -exec bash -c 'rmrf "$@"' _ {} + 2>/dev/null
 
-# Remove Python cache and compiled files
-find . -type d -name "__pycache__" -exec rm -rf {} +
-find . -type f -name "*.pyc" -delete
-find . -type f -name "*.pyo" -delete
-find . -type f -name "*~" -delete
+# test & typing caches
+for d in ./.pytest_cache ./.mypy_cache ./.ruff_cache ./htmlcov ./.coverage; do
+  [[ -e "$d" ]] && rmrf "$d"
+done
+# coverage files
+find "$FIND_ROOT" $SKIP_GIT -type f \( -name ".coverage" -o -name ".coverage.*" \) -print -delete
 
-# Remove test and tool caches
-rm -rf .pytest_cache/ .mypy_cache/ .tox/ .coverage .cache/
+# virtual envs / env caches (comment out if you want to keep them)
+for d in ./.venv ./.tox ./.nox ./.cache; do
+  [[ -e "$d" ]] && rmrf "$d"
+done
 
-echo "Cleanup complete."
+# Jupyter checkpoints
+find "$FIND_ROOT" $SKIP_GIT -type d -name ".ipynb_checkpoints" -prune -exec bash -c 'rmrf "$@"' _ {} + 2>/dev/null
 
+# Sphinx doctrees (if outside _build)
+find ./docs $SKIP_GIT -type d -name ".doctrees" -prune -exec bash -c 'rmrf "$@"' _ {} + 2>/dev/null || true
+find ./docs $SKIP_GIT -type f -name "*.doctree" -print -delete 2>/dev/null || true
+
+# OS cruft
+find "$FIND_ROOT" $SKIP_GIT -type f -name ".DS_Store" -print -delete
+find "$FIND_ROOT" $SKIP_GIT -type f -name "Thumbs.db" -print -delete
+find "$FIND_ROOT" $SKIP_GIT -type f -name "._*" -print -delete
+find "$FIND_ROOT" $SKIP_GIT -type d -name ".Trashes" -prune -exec bash -c 'rmrf "$@"' _ {} + 2>/dev/null
+
+# backup/editor swap files
+find "$FIND_ROOT" $SKIP_GIT -type f \( -name "*~" -o -name "*.swp" -o -name "*.bak" \) -print -delete
+
+# compiled extensions (optional)
+find "$FIND_ROOT" $SKIP_GIT -type f -name "*.so" -print -delete
+
+echo "✅ Everything Done Under the Sun."
