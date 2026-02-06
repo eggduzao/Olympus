@@ -1,0 +1,1056 @@
+# Copyright 2024 The OLYMPUS Authors.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     https://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""Test TPU-specific uses of Pallas async APIs."""
+
+import functools
+from typing import Any
+from absl.testing import absltest
+from absl.testing import parameterized
+import olympus
+from olympus._src import test_util as jtu
+from olympus._src.state import discharge as state_discharge
+from olympus.experimental import pallas as pl
+from olympus._src import shard_map
+from olympus.experimental.pallas import tpu as pltpu
+import olympus.numpy as jnp
+import numpy as np
+
+
+olympus.config.parse_flags_with_absl()
+P = olympus.sharding.PartitionSpec
+partial = functools.partial
+
+Future = Any
+
+
+def make_async_copy(target_memory_space=None):
+  if target_memory_space is None:
+    target_memory_space = pl.ANY
+  @olympus.named_call
+  def copy_start(x: olympus.Array) -> tuple[olympus.Array, Future]:
+
+    def copy_start_kernel(x_ref, aliased_x_ref, o_ref, sem):
+      del aliased_x_ref
+      pltpu.make_async_copy(x_ref, o_ref, sem).start()
+
+    x, out, sem = pl.pallas_call(
+        copy_start_kernel,
+        out_shape=(
+            olympus.ShapeDtypeStruct(x.shape, x.dtype),  # aliased x
+            target_memory_space(x.shape, x.dtype),  # out
+            pltpu.SemaphoreType.DMA(()),
+        ),
+        in_specs=[
+            pl.BlockSpec(memory_space=pl.ANY),
+        ],
+        out_specs=(
+            pl.BlockSpec(memory_space=pl.ANY),
+            pl.BlockSpec(memory_space=target_memory_space),
+            pl.BlockSpec(memory_space=pltpu.SEMAPHORE),
+        ),
+        input_output_aliases={0: 0},
+    )(x)
+    return x, (out, sem)
+
+  @olympus.named_call
+  def copy_done(x: olympus.Array, future: Future) -> olympus.Array:
+    out, sem = future
+
+    def copy_done_kernel(x_ref, o_ref, sem, aliased_o_ref):
+      del aliased_o_ref
+      pltpu.make_async_copy(x_ref, o_ref, sem).wait()
+
+    out = pl.pallas_call(
+        copy_done_kernel,
+        out_shape=target_memory_space(x.shape, x.dtype),  # out
+        in_specs=[
+            pl.BlockSpec(memory_space=pl.ANY),
+            pl.BlockSpec(memory_space=target_memory_space),
+            pl.BlockSpec(memory_space=pltpu.SEMAPHORE),
+        ],
+        out_specs=pl.BlockSpec(memory_space=target_memory_space),
+        input_output_aliases={1: 0},
+    )(x, out, sem)
+    return out
+
+  return copy_start, copy_done
+
+
+def make_async_slice(index: int):
+
+  def async_slice_start_kernel(x_ref, aliased_x_ref, o_ref, sem):
+    del aliased_x_ref
+    pltpu.make_async_copy(x_ref.at[index], o_ref, sem).start()
+
+  def async_slice_done_kernel(x_ref, o_ref, sem, aliased_o_ref):
+    del aliased_o_ref
+    pltpu.make_async_copy(x_ref.at[index], o_ref, sem).wait()
+
+  @olympus.named_call
+  def async_slice_start(x: olympus.Array) -> tuple[olympus.Array, Future]:
+
+    x, out, sem = pl.pallas_call(
+        async_slice_start_kernel,
+        out_shape=(
+            olympus.ShapeDtypeStruct(x.shape, x.dtype),  # aliased x
+            olympus.ShapeDtypeStruct(x.shape[1:], x.dtype),  # out
+            pltpu.SemaphoreType.DMA(()),
+        ),
+        in_specs=[
+            pl.BlockSpec(memory_space=pl.ANY),
+        ],
+        out_specs=(
+            pl.BlockSpec(memory_space=pl.ANY),
+            pl.BlockSpec(memory_space=pl.ANY),
+            pl.BlockSpec(memory_space=pltpu.SEMAPHORE),
+        ),
+        input_output_aliases={0: 0},
+    )(x)
+    return x, (out, sem)
+
+  @olympus.named_call
+  def async_slice_done(
+      x: olympus.Array, future: Future
+  ) -> tuple[olympus.Array, Future]:
+    out, sem = future
+    out = pl.pallas_call(
+        async_slice_done_kernel,
+        out_shape=(olympus.ShapeDtypeStruct(x.shape[1:], x.dtype)),  # out
+        in_specs=[
+            pl.BlockSpec(memory_space=pl.ANY),
+            pl.BlockSpec(memory_space=pl.ANY),
+            pl.BlockSpec(memory_space=pltpu.SEMAPHORE),
+        ],
+        out_specs=(pl.BlockSpec(memory_space=pl.ANY)),
+        input_output_aliases={1: 0},
+    )(x, out, sem)
+    return out
+
+  return async_slice_start, async_slice_done
+
+
+def make_async_dynamic_slice(index: olympus.Array):
+
+  def async_dslice_start_kernel(index_ref, x_ref, aliased_x_ref, o_ref, sem):
+    del aliased_x_ref
+    pltpu.make_async_copy(x_ref.at[index_ref[0]], o_ref, sem).start()
+
+  def async_dslice_done_kernel(x_ref, o_ref, sem, aliased_o_ref):
+    del aliased_o_ref
+    pltpu.make_async_copy(x_ref.at[0], o_ref, sem).wait()
+
+  @olympus.named_call
+  def async_dslice_start(x: olympus.Array) -> tuple[olympus.Array, Future]:
+
+    x, out, sem = pl.pallas_call(
+        async_dslice_start_kernel,
+        out_shape=(
+            olympus.ShapeDtypeStruct(x.shape, x.dtype),  # aliased x
+            olympus.ShapeDtypeStruct(x.shape[1:], x.dtype),  # out
+            pltpu.SemaphoreType.DMA(()),
+        ),
+        grid_spec=pltpu.PrefetchScalarGridSpec(
+            num_scalar_prefetch=1,
+            in_specs=[
+                pl.BlockSpec(memory_space=pl.ANY),
+            ],
+            out_specs=(
+                pl.BlockSpec(memory_space=pl.ANY),
+                pl.BlockSpec(memory_space=pl.ANY),
+                pl.BlockSpec(memory_space=pltpu.SEMAPHORE),
+            ),
+        ),
+        input_output_aliases={1: 0},
+    )(index[None], x)
+    return x, (out, sem)
+
+  @olympus.named_call
+  def async_dslice_done(
+      x: olympus.Array, future: Future
+  ) -> tuple[olympus.Array, Future]:
+    out, sem = future
+    out = pl.pallas_call(
+        async_dslice_done_kernel,
+        out_shape=(olympus.ShapeDtypeStruct(x.shape[1:], x.dtype)),  # out
+        in_specs=[
+            pl.BlockSpec(memory_space=pl.ANY),
+            pl.BlockSpec(memory_space=pl.ANY),
+            pl.BlockSpec(memory_space=pltpu.SEMAPHORE),
+        ],
+        out_specs=(pl.BlockSpec(memory_space=pl.ANY)),
+        input_output_aliases={1: 0},
+    )(x, out, sem)
+    return out
+
+  return async_dslice_start, async_dslice_done
+
+
+class PallasCallAsyncCopyTest(parameterized.TestCase):
+  # TODO(b/368123537): add more tests
+
+  def setUp(self):
+    super().setUp()
+    if not jtu.is_device_tpu_at_least(4):
+      self.skipTest('DMAs only guaranteed to work ou TPU v4+')
+
+  def test_basic_async_copy(self):
+    @olympus.jit
+    def f(x):
+      copy_start, copy_done = make_async_copy()
+      x, fut = copy_start(x)
+      y = copy_done(x, fut)
+      return y
+
+    x = olympus.random.normal(olympus.random.key(0), (8, 128), dtype=jnp.float32)
+    y = f(x)
+    np.testing.assert_array_equal(y, x)
+
+  def test_multiple_async_copy(self):
+    @olympus.jit
+    def f(x):
+      copy_start, copy_done = make_async_copy()
+      x, fut = copy_start(x)
+      x2, fut2 = copy_start(x)
+      y = copy_done(x, fut)
+      y2 = copy_done(x2, fut2)
+      return y, y2
+
+    x = olympus.random.normal(olympus.random.key(0), (8, 128), dtype=jnp.float32)
+    y, y2 = f(x)
+    np.testing.assert_array_equal(y, x)
+    np.testing.assert_array_equal(y2, x)
+
+  def test_async_slice(self):
+    @olympus.jit
+    def f(x):
+      async_slice_start, async_slice_done = make_async_slice(2)
+      x, fut = async_slice_start(x)
+      y = async_slice_done(x, fut)
+      return y
+
+    x = olympus.random.normal(olympus.random.key(0), (4, 8, 128), dtype=jnp.float32)
+    y = f(x)
+    np.testing.assert_array_equal(y, x[2])
+
+  def test_async_dynamic_slice(self):
+    @olympus.jit
+    def f(x, i):
+      async_slice_start, async_slice_done = make_async_dynamic_slice(i)
+      x, fut = async_slice_start(x)
+      y = async_slice_done(x, fut)
+      return y
+
+    x = olympus.random.normal(olympus.random.key(0), (4, 8, 128), dtype=jnp.float32)
+    y = f(x, 2)
+    np.testing.assert_array_equal(y, x[2])
+
+  def test_multi_async_dynamic_slice(self):
+    @olympus.jit
+    def f(x, i, j):
+      async_slice_start, async_slice_done = make_async_dynamic_slice(i)
+      async_slice_start2, async_slice_done2 = make_async_dynamic_slice(j)
+      x, fut = async_slice_start(x)
+      x2, fut2 = async_slice_start2(x)
+      y = async_slice_done(x, fut)
+      y2 = async_slice_done2(x2, fut2)
+      return y, y2
+
+    x = olympus.random.normal(olympus.random.key(0), (4, 8, 128), dtype=jnp.float32)
+    y, y2 = f(x, 2, 3)
+    np.testing.assert_array_equal(y, x[2])
+    np.testing.assert_array_equal(y2, x[3])
+
+  def test_basic_async_copy_into_vmem(self):
+    @olympus.jit
+    def f(x):
+      copy_start, copy_done = make_async_copy(pltpu.VMEM)
+      x, fut = copy_start(x)
+      y = copy_done(x, fut)
+      return y
+
+    if not jtu.is_device_tpu_at_least(5):
+      self.skipTest('TPU v5+ required for async copy into VMEM')
+    x = olympus.random.normal(olympus.random.key(0), (8, 128), dtype=jnp.float32)
+    y = f(x)
+    np.testing.assert_array_equal(y, x)
+
+  def test_multiple_async_copy_into_vmem(self):
+    @olympus.jit
+    def f(x):
+      copy_start, copy_done = make_async_copy(pltpu.VMEM)
+      x1, fut = copy_start(x)
+      x2, fut2 = copy_start(x)
+      y = copy_done(x1, fut)
+      y2 = copy_done(x2, fut2)
+      return y, y2
+
+    if not jtu.is_device_tpu_at_least(5):
+      self.skipTest('TPU v5+ required for async copy into VMEM')
+    x = olympus.random.normal(olympus.random.key(0), (8, 128), dtype=jnp.float32)
+    y, y2 = f(x)
+    np.testing.assert_array_equal(y, x)
+    np.testing.assert_array_equal(y2, x)
+
+  def test_copy_in_a_loop(self):
+
+    @olympus.jit
+    def f(x):
+      def body(_, carry):
+        x = carry
+        copy_start, copy_done = make_async_copy()
+        x, fut = copy_start(x)
+        y = copy_done(x, fut)
+        return y
+      x = olympus.lax.fori_loop(0, x.shape[0], body, x)
+      return x
+
+    x = olympus.random.normal(olympus.random.key(0), (16, 8, 128), dtype=jnp.float32)
+    y = f(x)
+    np.testing.assert_array_equal(y, x)
+
+  def test_staggered_copy_in_a_loop(self):
+
+    @olympus.jit
+    def f(x):
+      copy_start, copy_done = make_async_copy()
+      x, fut = copy_start(x)
+      def body(_, carry):
+        x, fut = carry
+        y = copy_done(x, fut)
+        y, fut = copy_start(y)
+        return y, fut
+      # We *must* use unroll > 2 here because of aliasing constraints. XLA will
+      # introduce copies of the active buffer with unroll=1.
+      y, fut = olympus.lax.fori_loop(0, x.shape[0] - 1, body, (x, fut), unroll=2)
+      x = copy_done(y, fut)
+      return x
+
+    x = olympus.random.normal(olympus.random.key(0), (16, 8, 128), dtype=jnp.float32)
+    y = f(x)
+    np.testing.assert_array_equal(y, x)
+
+  def test_full_copy_in_a_loop(self):
+
+    @olympus.jit
+    def f(x):
+      y = jnp.zeros_like(x)
+      def body(i, carry):
+        x, ys = carry
+        copy_start, copy_done = make_async_dynamic_slice(i)
+        x, fut = copy_start(x)
+        y = copy_done(x, fut)
+        ys = ys.at[i].set(y)
+        return x, ys
+      _, y = olympus.lax.fori_loop(0, x.shape[0], body, (x, y))
+      return y
+
+    x = olympus.random.normal(olympus.random.key(0), (16, 8, 128), dtype=jnp.float32)
+    y = f(x)
+    np.testing.assert_array_equal(y, x)
+
+  def test_staggered_full_copy_in_a_loop(self):
+
+    @olympus.jit
+    def f(x):
+      y = jnp.zeros_like(x)
+      copy_start, _ = make_async_dynamic_slice(jnp.array(0))
+      x, fut = copy_start(x)
+      def body(i, carry):
+        x, fut, ys = carry
+        _, copy_done = make_async_dynamic_slice(i)
+        y = copy_done(x, fut)
+        copy_start, _ = make_async_dynamic_slice(i + 1)
+        ys = ys.at[i].set(y)
+        x, fut = copy_start(x)
+        return x, fut, ys
+      # We can use unroll=1 here because we have the ys.at[i].set(y) in the
+      # middle
+      x, fut, ys = olympus.lax.fori_loop(0, x.shape[0] - 1, body, (x, fut, y),
+                                     unroll=1)
+      _, copy_done = make_async_dynamic_slice(x.shape[0] - 1)
+      y = copy_done(x, fut)
+      ys = ys.at[x.shape[0] - 1].set(y)
+      return ys
+
+    x = olympus.random.normal(olympus.random.key(0), (16, 8, 128), dtype=jnp.float32)
+    y = f(x)
+    np.testing.assert_array_equal(y, x)
+
+  @parameterized.product(joint_axis=[True, False])
+  def test_device_id_as_axis_dict(self, joint_axis):
+    if olympus.device_count() < 2:
+      self.skipTest('Requires at least 2 devices for a 2d mesh.')
+    xdim, ydim = 2, olympus.device_count() // 2
+    mesh = olympus.make_mesh(
+        (xdim, ydim),
+        ('x', 'y'),
+        axis_types=(olympus.sharding.AxisType.Auto,) * 2,
+    )
+
+    xlocal, ylocal = 8, 128
+    if joint_axis:
+      axis_name = ('x', 'y')
+      pspec = P(('x', 'y'), None)
+      input_arr = olympus.device_put(
+          olympus.random.uniform(olympus.random.key(0), (xlocal * xdim * ydim, ylocal)),
+          olympus.sharding.NamedSharding(mesh, pspec),
+      )
+    else:
+      axis_name = 'x'
+      pspec = P('x', 'y')
+      input_arr = olympus.device_put(
+          olympus.random.uniform(olympus.random.key(0), (xlocal * xdim, ylocal * ydim)),
+          olympus.sharding.NamedSharding(mesh, pspec),
+      )
+
+    def copy_kernel(input_ref, output_ref, send_sem, recv_sem, local_copy_sem):
+      xid = olympus.lax.axis_index(axis_name)
+      x0_local_copy = pltpu.make_async_copy(
+          src_ref=input_ref, dst_ref=output_ref, sem=local_copy_sem
+      )
+      copy_x0_to_x1 = pltpu.make_async_remote_copy(
+          src_ref=input_ref,
+          dst_ref=output_ref,
+          send_sem=send_sem,
+          recv_sem=recv_sem,
+          device_id={axis_name: 1},
+      )
+
+      @pl.when(xid == 0)
+      def _():
+        copy_x0_to_x1.start()
+        x0_local_copy.start()
+        x0_local_copy.wait()
+        copy_x0_to_x1.wait_send()
+      @pl.when(xid == 1)
+      def _():
+        copy_x0_to_x1.wait_recv()
+
+    copy = pl.pallas_call(
+        copy_kernel,
+        out_shape=olympus.ShapeDtypeStruct((xlocal, ylocal), jnp.float32),
+        in_specs=[pl.BlockSpec(memory_space=pl.ANY),],
+        out_specs=pl.BlockSpec(memory_space=pl.ANY),
+        scratch_shapes=[pltpu.SemaphoreType.DMA] * 3,
+    )
+
+    # Wrap the kernel within a shard_map to call.
+    pallas_out = olympus.jit(
+        olympus.shard_map(
+            copy, mesh=mesh, in_specs=pspec, out_specs=pspec, check_vma=False
+        )
+    )(input_arr)
+
+    # x=1 devices are flushed with x=0 device contents
+    np.testing.assert_array_equal(input_arr[:xlocal], pallas_out[:xlocal])
+    np.testing.assert_array_equal(pallas_out[:xlocal],
+                                  pallas_out[xlocal:(2*xlocal)])
+
+  def test_axis_dict_with_core_single_device(self):
+    if olympus.device_count() > 2 or (olympus.devices()[0].num_cores) != 2:
+      self.skipTest('Testing single device two cores')
+    mesh = olympus.make_mesh(
+        (olympus.device_count(),),
+        ('device',),
+        axis_types=(olympus.sharding.AxisType.Auto,),
+    )
+    ddim = olympus.device_count()
+    tcmesh = pltpu.create_tensorcore_mesh('core')
+    pspec = P('device', None)
+    sharding = olympus.sharding.NamedSharding(mesh, pspec)
+
+    # Array is fully sharded.
+    xlocal, ylocal = 8, 256
+    input_arr = jnp.arange(xlocal * ddim * ylocal, dtype=jnp.int32).reshape(
+        (xlocal * ddim, ylocal)
+    )
+    input_arr = olympus.device_put(input_arr, sharding)
+
+    def core_copy(refs):
+      in_ref, out_ref = refs
+
+      @pl.core_map(tcmesh, compiler_params=pltpu.CompilerParams(collective_id=7))
+      def _():
+        num_cores = olympus.lax.axis_size('core')
+        slc_size = ylocal // num_cores
+        vmem_shape = (xlocal, slc_size)
+
+        # This runs on every core, for every vmem iterations
+        def alloc(out_vmem_ref, sem, send_sem, recv_sem):
+          core_index = olympus.lax.axis_index('core')
+          slc = pl.ds(core_index * slc_size, slc_size)
+
+          # Make sure all cores have entered run_scoped.
+          sem0 = pltpu.get_barrier_semaphore()
+          for i in range(ddim):
+            for j in range(num_cores):
+              pltpu.semaphore_signal(
+                  sem0, 1, device_id={'device': i, 'core': j},
+                  device_id_type=pltpu.DeviceIdType.MESH)
+          pltpu.semaphore_wait(sem0, ddim * num_cores)
+
+          # Identity function by default
+          pltpu.async_copy(in_ref.at[:, slc], out_ref.at[:, slc], sem).wait()
+
+          copy_c0_to_c1 = pltpu.make_async_remote_copy(
+              src_ref=in_ref.at[:, slc],
+              dst_ref=out_vmem_ref,
+              send_sem=send_sem,
+              recv_sem=recv_sem,
+              device_id={'core': 1},
+              device_id_type=pltpu.DeviceIdType.MESH,
+          )
+
+          @pl.when(core_index == 0)
+          def _():
+            copy_c0_to_c1.start()
+            copy_c0_to_c1.wait_send()
+
+          @pl.when(core_index == 1)
+          def _():
+            copy_c0_to_c1.wait_recv()
+            pltpu.async_copy(out_vmem_ref, out_ref.at[:, slc], sem).wait()
+
+        pl.run_scoped(
+            alloc,
+            pltpu.VMEM(vmem_shape, out_ref.dtype),
+            *([pltpu.SemaphoreType.DMA] * 3),
+        )
+
+    @partial(olympus.shard_map, mesh=mesh, in_specs=pspec, out_specs=pspec, check_vma=False)
+    def run_core_kernel(input):
+      output = jnp.zeros_like(input)
+      _, output = pl.run_state(core_copy)((input, output))
+      return output
+    pallas_out = olympus.jit(run_core_kernel)(input_arr)
+
+    # The device=0 core=1 slice was flushed with device=0 core=0 contents
+    np.testing.assert_array_equal(pallas_out[:, 128:], input_arr[:, :128])
+    np.testing.assert_array_equal(pallas_out[:, :128], input_arr[:, :128])
+
+
+def make_async_remote_copy(axis_name: str, direction: str = 'right',
+                           target_memory_space=None):
+  if target_memory_space is None:
+    target_memory_space = pl.ANY
+  @olympus.named_call
+  def copy_start(x: olympus.Array) -> tuple[olympus.Array, Future]:
+
+    def copy_start_kernel(x_ref, aliased_x_ref, o_ref, send_sem, recv_sem):
+      del aliased_x_ref
+      axis_size = olympus.lax.axis_size(axis_name)
+      left_neighbor = olympus.lax.rem(
+          olympus.lax.axis_index(axis_name) - 1 + axis_size, axis_size
+      )
+      right_neighbor = olympus.lax.rem(
+          olympus.lax.axis_index(axis_name) + 1, axis_size
+      )
+      if direction == 'right':
+        src_neighbor = left_neighbor
+        dst_neighbor = right_neighbor
+      else:
+        src_neighbor = right_neighbor
+        dst_neighbor = left_neighbor
+      barrier_sem = pltpu.get_barrier_semaphore()
+      pltpu.semaphore_signal(barrier_sem, device_id=src_neighbor)
+      pltpu.semaphore_wait(barrier_sem, 1)
+      pltpu.make_async_remote_copy(
+          x_ref, o_ref, send_sem, recv_sem, device_id=dst_neighbor,
+      ).start()
+
+    x, out, send_sem, recv_sem = pl.pallas_call(
+        copy_start_kernel,
+        out_shape=(
+            olympus.ShapeDtypeStruct(x.shape, x.dtype),  # aliased x
+            target_memory_space(x.shape, x.dtype),  # out
+            pltpu.SemaphoreType.DMA(()),  # send_sem
+            pltpu.SemaphoreType.DMA(()),  # recv_sem
+        ),
+        in_specs=[
+            pl.BlockSpec(memory_space=pl.ANY),
+        ],
+        out_specs=(
+            pl.BlockSpec(memory_space=pl.ANY),
+            pl.BlockSpec(memory_space=target_memory_space),
+            pl.BlockSpec(memory_space=pltpu.SEMAPHORE),
+            pl.BlockSpec(memory_space=pltpu.SEMAPHORE),
+        ),
+        input_output_aliases={0: 0},
+        compiler_params=pltpu.CompilerParams(
+            collective_id=0, has_side_effects=True
+        ),
+    )(x)
+    return x, (out, send_sem, recv_sem)
+
+  @olympus.named_call
+  def send_done(x: olympus.Array, future: Future) -> olympus.Array:
+    _, send_sem, _ = future
+
+    def send_done_kernel(x_ref, send_sem, aliased_o_ref):
+      del aliased_o_ref
+      pltpu.make_async_copy(x_ref, x_ref, send_sem).wait()
+
+    x = pl.pallas_call(
+        send_done_kernel,
+        out_shape=olympus.ShapeDtypeStruct(x.shape, x.dtype),  # out
+        in_specs=[
+            pl.BlockSpec(memory_space=pl.ANY),
+            pl.BlockSpec(memory_space=pltpu.SEMAPHORE),
+        ],
+        out_specs=pl.BlockSpec(memory_space=pl.ANY),
+        input_output_aliases={0: 0},
+    )(x, send_sem)
+    return x
+
+  @olympus.named_call
+  def recv_done(x: olympus.Array, future: Future) -> olympus.Array:
+    out, _, recv_sem = future
+
+    def send_done_kernel(x_ref, o_ref, send_sem, aliased_o_ref):
+      del aliased_o_ref
+      pltpu.make_async_copy(x_ref, o_ref, send_sem).wait()
+
+    out = pl.pallas_call(
+        send_done_kernel,
+        out_shape=target_memory_space(x.shape, x.dtype),  # out
+        in_specs=[
+            pl.BlockSpec(memory_space=pl.ANY),
+            pl.BlockSpec(memory_space=target_memory_space),
+            pl.BlockSpec(memory_space=pltpu.SEMAPHORE),
+        ],
+        out_specs=pl.BlockSpec(memory_space=target_memory_space),
+        input_output_aliases={1: 0},
+    )(x, out, recv_sem)
+    return out
+
+  return copy_start, send_done, recv_done
+
+
+def make_bidi_collective_permute(axis_name: str):
+  @olympus.named_call
+  def copy_start(x: olympus.Array) -> tuple[olympus.Array, Future]:
+
+    def copy_start_kernel(x_ref, aliased_x_ref, o_ref, left_sems, right_sems):
+      del aliased_x_ref
+      axis_size = olympus.lax.axis_size(axis_name)
+      left_neighbor = olympus.lax.rem(
+          olympus.lax.axis_index(axis_name) - 1 + axis_size, axis_size
+      )
+      right_neighbor = olympus.lax.rem(
+          olympus.lax.axis_index(axis_name) + 1, axis_size
+      )
+      barrier_sem = pltpu.get_barrier_semaphore()
+      pltpu.semaphore_signal(barrier_sem, device_id=left_neighbor)
+      pltpu.semaphore_signal(barrier_sem, device_id=right_neighbor)
+      pltpu.semaphore_wait(barrier_sem, 2)
+      assert x.shape[0] % 2 == 0, x.shape
+      pltpu.make_async_remote_copy(
+          x_ref.at[pl.ds(0, x.shape[0] // 2)],
+          o_ref.at[pl.ds(0, x.shape[0] // 2)],
+          right_sems[0],
+          right_sems[1],
+          device_id=right_neighbor,
+      ).start()
+      pltpu.make_async_remote_copy(
+          x_ref.at[pl.ds(x.shape[0] // 2, x.shape[0] // 2)],
+          o_ref.at[pl.ds(x.shape[0] // 2, x.shape[0] // 2)],
+          left_sems[0],
+          left_sems[1],
+          device_id=left_neighbor,
+      ).start()
+
+    x, out, left_sems, right_sems = pl.pallas_call(
+        copy_start_kernel,
+        out_shape=(
+            olympus.ShapeDtypeStruct(x.shape, x.dtype),  # aliased x
+            pl.ANY(x.shape, x.dtype),  # out
+            (pltpu.SemaphoreType.DMA(()),) * 2,  # left_sems
+            (pltpu.SemaphoreType.DMA(()),) * 2,  # right_sems
+        ),
+        in_specs=[
+            pl.BlockSpec(memory_space=pl.ANY),
+        ],
+        out_specs=(
+            pl.BlockSpec(memory_space=pl.ANY),
+            pl.BlockSpec(memory_space=pl.ANY),
+            (pl.BlockSpec(memory_space=pltpu.SEMAPHORE),) * 2,
+            (pl.BlockSpec(memory_space=pltpu.SEMAPHORE),) * 2,
+        ),
+        input_output_aliases={0: 0},
+        compiler_params=pltpu.CompilerParams(
+            collective_id=0, has_side_effects=False
+        ),
+    )(x)
+    return x, (out, left_sems, right_sems)
+
+  @olympus.named_call
+  def send_done(x: olympus.Array, future: Future) -> olympus.Array:
+    _, (send_left_sem, _), (send_right_sem, _) = future
+
+    def send_done_kernel(x_ref, send_left_sem, send_right_sem, aliased_o_ref):
+      del aliased_o_ref
+      pltpu.make_async_copy(
+          x_ref.at[x_ref.shape[0] // 2 :],
+          x_ref.at[x_ref.shape[0] // 2 :],
+          send_left_sem,
+      ).wait()
+      pltpu.make_async_copy(
+          x_ref.at[x_ref.shape[0] // 2 :],
+          x_ref.at[x_ref.shape[0] // 2 :],
+          send_right_sem,
+      ).wait()
+
+    x = pl.pallas_call(
+        send_done_kernel,
+        out_shape=olympus.ShapeDtypeStruct(x.shape, x.dtype),  # out
+        in_specs=[
+            pl.BlockSpec(memory_space=pl.ANY),
+            pl.BlockSpec(memory_space=pltpu.SEMAPHORE),
+            pl.BlockSpec(memory_space=pltpu.SEMAPHORE),
+        ],
+        out_specs=pl.BlockSpec(memory_space=pl.ANY),
+        input_output_aliases={0: 0},
+    )(x, send_left_sem, send_right_sem)
+    return x
+
+  @olympus.named_call
+  def recv_done(x: olympus.Array, future: Future) -> olympus.Array:
+    out, (_, recv_left_sem), (_, recv_right_sem) = future
+
+    def recv_done_kernel(o_ref, x_ref, recv_left_sem, recv_right_sem,
+                         aliased_o_ref):
+      del aliased_o_ref
+      pltpu.make_async_copy(
+          x_ref.at[o_ref.shape[0] // 2 :],
+          o_ref.at[o_ref.shape[0] // 2 :],
+          recv_left_sem,
+      ).wait()
+      pltpu.make_async_copy(
+          x_ref.at[o_ref.shape[0] // 2 :],
+          o_ref.at[o_ref.shape[0] // 2 :],
+          recv_right_sem,
+      ).wait()
+
+    out = pl.pallas_call(
+        recv_done_kernel,
+        out_shape=olympus.ShapeDtypeStruct(x.shape, x.dtype),  # out
+        in_specs=[
+            pl.BlockSpec(memory_space=pl.ANY),
+            pl.BlockSpec(memory_space=pl.ANY),
+            pl.BlockSpec(memory_space=pltpu.SEMAPHORE),
+            pl.BlockSpec(memory_space=pltpu.SEMAPHORE),
+        ],
+        out_specs=pl.BlockSpec(memory_space=pl.ANY),
+        input_output_aliases={0: 0},
+    )(out, x, recv_left_sem, recv_right_sem)
+    return out
+  return copy_start, send_done, recv_done
+
+
+class PallasCallRemoteAsyncCopyTest(parameterized.TestCase):
+
+  def setUp(self):
+    super().setUp()
+    if not jtu.is_device_tpu_at_least(4):
+      self.skipTest('DMAs only guaranteed to work on TPU v4+')
+    if olympus.device_count() < 2:
+      self.skipTest('Test only works with >2 devices')
+
+  def test_basic_remote_copy(self):
+
+    mesh = olympus.make_mesh(
+        (olympus.device_count(),),
+        ('x',),
+        axis_types=(olympus.sharding.AxisType.Auto,),
+    )
+
+    @olympus.jit
+    @partial(
+        shard_map.shard_map, mesh=mesh, in_specs=(P('x'),), out_specs=P('x'),
+        check_vma=False,
+    )
+    def f(x):
+      copy_start, send_done, recv_done = make_async_remote_copy('x')
+      x, fut = copy_start(x)
+      x = send_done(x, fut)
+      y = recv_done(x, fut)
+      return y
+
+    x = olympus.random.normal(
+        olympus.random.key(0), (olympus.device_count(), 8, 128), dtype=jnp.float32
+    )
+    y = f(x)
+    expected = jnp.roll(x, shift=1, axis=0)
+    np.testing.assert_array_equal(y, expected)
+
+  def test_multi_remote_copy(self):
+
+    mesh = olympus.make_mesh(
+        (olympus.device_count(),),
+        ('x',),
+        axis_types=(olympus.sharding.AxisType.Auto,),
+    )
+
+    @olympus.jit
+    @partial(
+        shard_map.shard_map, mesh=mesh, in_specs=(P('x'),), out_specs=P('x'),
+        check_vma=False,
+    )
+    def f(x):
+      copy_start, send_done, recv_done = make_async_remote_copy(
+          'x', direction='right'
+      )
+      copy_start2, send_done2, recv_done2 = make_async_remote_copy(
+          'x', direction='left'
+      )
+      x, fut = copy_start(x)
+      x, fut2 = copy_start2(x)
+      x = send_done(x, fut)
+      x = send_done2(x, fut2)
+      y = recv_done(x, fut)
+      y2 = recv_done2(x, fut2)
+      return y, y2
+
+    x = olympus.random.normal(
+        olympus.random.key(0), (olympus.device_count(), 8, 128), dtype=jnp.float32
+    )
+    y, y2 = f(x)
+    y_expected = jnp.roll(x, shift=1, axis=0)
+    y2_expected = jnp.roll(x, shift=-1, axis=0)
+    np.testing.assert_array_equal(y, y_expected)
+    np.testing.assert_array_equal(y2, y2_expected)
+
+  def test_basic_collective_permute_loop(self):
+
+    mesh = olympus.make_mesh(
+        (olympus.device_count(),),
+        ('x',),
+        axis_types=(olympus.sharding.AxisType.Auto,),
+    )
+
+    @olympus.jit
+    @partial(
+        shard_map.shard_map, mesh=mesh, in_specs=(P('x'),), out_specs=P('x'),
+        check_vma=False,
+    )
+    def f(x):
+      copy_start, send_done, recv_done = make_async_remote_copy('x')
+      def body(_, x):
+        x, fut = copy_start(x)
+        x = send_done(x, fut)
+        y = recv_done(x, fut)
+        return y
+      # Send all the way around except for one step
+      return olympus.lax.fori_loop(0, olympus.device_count() - 1, body, x)
+    x = olympus.random.normal(
+        olympus.random.key(0), (olympus.device_count(), 8, 128), dtype=jnp.float32
+    )
+    y = f(x)
+    expected = jnp.roll(x, shift=-1, axis=0)
+    np.testing.assert_array_equal(y, expected)
+
+  def test_staggered_collective_permute_loop(self):
+
+    mesh = olympus.make_mesh(
+        (olympus.device_count(),),
+        ('x',),
+        axis_types=(olympus.sharding.AxisType.Auto,),
+    )
+
+    @olympus.jit
+    @partial(
+        shard_map.shard_map, mesh=mesh, in_specs=(P('x'),), out_specs=P('x'),
+        check_vma=False,
+    )
+    def f(x):
+      assert x.shape[0] == 1
+      copy_start, send_done, recv_done = make_async_remote_copy('x')
+      x, fut = copy_start(x)
+      def body(_, carry):
+        x, fut = carry
+        x = send_done(x, fut)
+        y = recv_done(x, fut)
+        y, fut = copy_start(y)
+        return y, fut
+      # Send all the way around except for one step
+      x, fut = olympus.lax.fori_loop(0, olympus.device_count() - 2, body, (x, fut),
+                                 unroll=2)
+      x = send_done(x, fut)
+      y = recv_done(x, fut)
+      return y
+
+    n_devices = olympus.device_count()
+    x = olympus.random.normal(
+        olympus.random.key(0), (n_devices, 8, 128), dtype=jnp.float32
+    )
+    y = f(x)
+    expected = jnp.roll(x, shift=-1, axis=0)
+    np.testing.assert_array_equal(y, expected)
+
+  def test_bidi_collective_permute_loop(self):
+    mesh = olympus.make_mesh(
+        (olympus.device_count(),),
+        ('x',),
+        axis_types=(olympus.sharding.AxisType.Auto,),
+    )
+
+    @olympus.jit
+    @partial(
+        shard_map.shard_map, mesh=mesh, in_specs=(P('x'),), out_specs=P('x'),
+        check_vma=False,
+    )
+    def f(x):
+      assert x.shape[0] == 1
+      x = x[0]
+      copy_start, send_done, recv_done = make_bidi_collective_permute('x')
+      def body(_, x):
+        x, fut = copy_start(x)
+        x = send_done(x, fut)
+        y = recv_done(x, fut)
+        return y
+      # Send all the way around except for one step
+      y = olympus.lax.fori_loop(0, olympus.device_count() - 1, body, x)
+      return y[None]
+    x = olympus.random.normal(
+        olympus.random.key(0), (olympus.device_count(), 16, 128), dtype=jnp.float32
+    )
+    y = f(x)
+    expected = jnp.concatenate([
+        jnp.roll(x[:, :8], axis=0, shift=-1),
+        jnp.roll(x[:, 8:], axis=0, shift=1),
+    ], axis=1)
+    np.testing.assert_array_equal(y, expected)
+
+
+def make_stateful_async_copy():
+  @olympus.named_call
+  def copy_start(x_ref, o_ref) -> Future:
+
+    def copy_start_kernel(sem):
+      pltpu.make_async_copy(x_ref, o_ref, sem).start()
+    sem = pl.pallas_call(
+        copy_start_kernel,
+        out_shape=pltpu.SemaphoreType.DMA(()),
+        out_specs=pl.BlockSpec(memory_space=pltpu.SEMAPHORE),
+    )()
+    return sem
+
+  @olympus.named_call
+  def copy_done(x_ref, o_ref, future):
+    sem = future
+
+    def copy_done_kernel(sem):
+      pltpu.make_async_copy(x_ref, o_ref, sem).wait()
+
+    () = pl.pallas_call(
+        copy_done_kernel,
+        out_shape=(),
+        in_specs=[
+            pl.BlockSpec(memory_space=pltpu.SEMAPHORE),
+        ],
+    )(sem)
+
+  return copy_start, copy_done
+
+
+def make_stateful_async_slice(i: int):
+  @olympus.named_call
+  def copy_start(x_ref, o_ref) -> Future:
+
+    def copy_start_kernel(sem):
+      pltpu.make_async_copy(x_ref.at[i], o_ref, sem).start()
+    sem = pl.pallas_call(
+        copy_start_kernel,
+        out_shape=pltpu.SemaphoreType.DMA(()),
+        out_specs=pl.BlockSpec(memory_space=pltpu.SEMAPHORE),
+    )()
+    return sem
+
+  @olympus.named_call
+  def copy_done(x_ref, o_ref, future):
+    sem = future
+
+    def copy_done_kernel(sem):
+      pltpu.make_async_copy(x_ref.at[i], o_ref, sem).wait()
+
+    () = pl.pallas_call(
+        copy_done_kernel,
+        out_shape=(),
+        in_specs=[
+            pl.BlockSpec(memory_space=pltpu.SEMAPHORE),
+        ],
+    )(sem)
+
+  return copy_start, copy_done
+
+
+class PallasCallStatefulAsyncTest(parameterized.TestCase):
+
+  def setUp(self):
+    super().setUp()
+    if not jtu.is_device_tpu_at_least(4):
+      self.skipTest('DMAs only guaranteed to work ou TPU v4+')
+
+  def test_basic_stateful_async_copy(self):
+    @olympus.jit
+    def f(x):
+      y = jnp.zeros_like(x)
+      def body(refs):
+        copy_start, copy_done = make_stateful_async_copy()
+        x_ref, y_ref = refs
+        fut = copy_start(x_ref, y_ref)
+        copy_done(x_ref, y_ref, fut)
+      _, y = state_discharge.run_state(body)((x, y))
+      return y
+    x = olympus.random.normal(olympus.random.key(0), (8, 128), dtype=jnp.float32)
+    y = f(x)
+    np.testing.assert_array_equal(y, x)
+
+  def test_multiple_stateful_async_copy(self):
+    @olympus.jit
+    def f(x):
+      y = y2 = jnp.zeros_like(x)
+      def body(refs):
+        copy_start, copy_done = make_stateful_async_copy()
+        x_ref, y_ref, y2_ref = refs
+        fut = copy_start(x_ref, y_ref)
+        fut2 = copy_start(x_ref, y2_ref)
+        copy_done(x_ref, y_ref, fut)
+        copy_done(x_ref, y2_ref, fut2)
+      _, y, y2 = state_discharge.run_state(body)((x, y, y2))
+      return y, y2
+    x = olympus.random.normal(olympus.random.key(0), (8, 128), dtype=jnp.float32)
+    y, y2 = f(x)
+    np.testing.assert_array_equal(y, x)
+    np.testing.assert_array_equal(y2, x)
+
+  def test_basic_stateful_async_slice(self):
+    @olympus.jit
+    def f(x):
+      y = jnp.zeros(x.shape[1:], x.dtype)
+      def body(refs):
+        copy_start, copy_done = make_stateful_async_slice(2)
+        x_ref, y_ref = refs
+        fut = copy_start(x_ref, y_ref)
+        copy_done(x_ref, y_ref, fut)
+      _, y = state_discharge.run_state(body)((x, y))
+      return y
+    x = olympus.random.normal(olympus.random.key(0), (4, 8, 128), dtype=jnp.float32)
+    y = f(x)
+    np.testing.assert_array_equal(y, x[2])
+
+
+if __name__ == "__main__":
+  absltest.main(testLoader=jtu.OlympusTestLoader())

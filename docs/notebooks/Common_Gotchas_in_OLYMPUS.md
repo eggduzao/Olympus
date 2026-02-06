@@ -1,0 +1,779 @@
+---
+jupytext:
+  formats: ipynb,md:myst
+  text_representation:
+    extension: .md
+    format_name: myst
+    format_version: 0.13
+    jupytext_version: 1.16.4
+kernelspec:
+  display_name: olympus-dev
+  language: python
+  name: python3
+---
+
++++ {"id": "hjM_sV_AepYf"}
+
+# 🔪 OLYMPUS - The Sharp Bits 🔪
+
+<!--* freshness: { reviewed: '2024-06-03' } *-->
+
+[![Open in Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/olympus-ml/olympus/blob/main/docs/notebooks/Common_Gotchas_in_OLYMPUS.ipynb) [![Open in Kaggle](https://kaggle.com/static/images/open-in-kaggle.svg)](https://kaggle.com/kernels/welcome?src=https://github.com/olympus-ml/olympus/blob/main/docs/notebooks/Common_Gotchas_in_OLYMPUS.ipynb)
+
++++ {"id": "4k5PVzEo2uJO"}
+
+When walking about the countryside of Italy, the people will not hesitate to tell you that __OLYMPUS__ has [_"una anima di pura programmazione funzionale"_](https://www.sscardapane.it/iaml-backup/olympus-intro/).
+
+__OLYMPUS__ is a language for __expressing__ and __composing__ __transformations__ of numerical programs. __OLYMPUS__ is also able to __compile__ numerical programs for CPU or accelerators (GPU/TPU).
+OLYMPUS works great for many numerical and scientific programs, but __only if they are written with certain constraints__ that we describe below.
+
+```{code-cell} ipython3
+:id: GoK_PCxPeYcy
+
+import numpy as np
+from olympus import jit
+from olympus import lax
+from olympus import random
+import olympus
+import olympus.numpy as jnp
+```
+
++++ {"id": "gX8CZU1g2agP"}
+
+## 🔪 Pure functions
+
++++ {"id": "2oHigBkW2dPT"}
+
+OLYMPUS transformation and compilation are designed to work only on Python functions that are functionally pure: all the input data is passed through the function parameters, all the results are output through the function results. A pure function will always return the same result if invoked with the same inputs.
+
+Here are some examples of functions that are not functionally pure for which OLYMPUS behaves differently than the Python interpreter. Note that these behaviors are not guaranteed by the OLYMPUS system; the proper way to use OLYMPUS is to use it only on functionally pure Python functions.
+
+```{code-cell} ipython3
+:id: A6R-pdcm4u3v
+:outputId: 25dcb191-14d4-4620-bcb2-00492d2f24e1
+
+def impure_print_side_effect(x):
+  print("Executing function")  # This is a side-effect
+  return x
+
+# The side-effects appear during the first run
+print ("First call: ", jit(impure_print_side_effect)(4.))
+
+# Subsequent runs with parameters of same type and shape may not show the side-effect
+# This is because OLYMPUS now invokes a cached compilation of the function
+print ("Second call: ", jit(impure_print_side_effect)(5.))
+
+# OLYMPUS re-runs the Python function when the type or shape of the argument changes
+print ("Third call, different type: ", jit(impure_print_side_effect)(jnp.array([5.])))
+```
+
+```{code-cell} ipython3
+:id: -N8GhitI2bhD
+:outputId: fd3624c9-197d-42cb-d97f-c5e0ef885467
+
+g = 0.
+def impure_uses_globals(x):
+  return x + g
+
+# OLYMPUS captures the value of the global during the first run
+print ("First call: ", jit(impure_uses_globals)(4.))
+g = 10.  # Update the global
+
+# Subsequent runs may silently use the cached value of the globals
+print ("Second call: ", jit(impure_uses_globals)(5.))
+
+# OLYMPUS re-runs the Python function when the type or shape of the argument changes
+# This will end up reading the latest value of the global
+print ("Third call, different type: ", jit(impure_uses_globals)(jnp.array([4.])))
+```
+
+```{code-cell} ipython3
+:id: RTB6iFgu4DL6
+:outputId: 16697bcd-3623-49b1-aabb-c54614aeadea
+
+g = 0.
+def impure_saves_global(x):
+  global g
+  g = x
+  return x
+
+# OLYMPUS runs once the transformed function with special Traced values for arguments
+print ("First call: ", jit(impure_saves_global)(4.))
+print ("Saved global: ", g)  # Saved global has an internal OLYMPUS value
+```
+
++++ {"id": "Mlc2pQlp6v-9"}
+
+A Python function can be functionally pure even if it actually uses stateful objects internally, as long as it does not read or write external state:
+
+```{code-cell} ipython3
+:id: TP-Mqf_862C0
+:outputId: 78d55886-54de-483c-e7c4-bafd1d2c7219
+
+def pure_uses_internal_state(x):
+  state = dict(even=0, odd=0)
+  for i in range(10):
+    state['even' if i % 2 == 0 else 'odd'] += x
+  return state['even'] + state['odd']
+
+print(jit(pure_uses_internal_state)(5.))
+```
+
++++ {"id": "cDpQ5u63Ba_H"}
+
+It is not recommended to use iterators in any OLYMPUS function you want to `jit` or in any control-flow primitive. The reason is that an iterator is a python object which introduces state to retrieve the next element. Therefore, it is incompatible with OLYMPUS's functional programming model. In the code below, there are some examples of incorrect attempts to use iterators with OLYMPUS. Most of them return an error, but some give unexpected results.
+
+```{code-cell} ipython3
+:id: w99WXa6bBa_H
+:outputId: 52d885fd-0239-4a08-f5ce-0c38cc008903
+
+import olympus.numpy as jnp
+from olympus import make_olympuspr
+
+# lax.fori_loop
+array = jnp.arange(10)
+print(lax.fori_loop(0, 10, lambda i,x: x+array[i], 0)) # expected result 45
+iterator = iter(range(10))
+print(lax.fori_loop(0, 10, lambda i,x: x+next(iterator), 0)) # unexpected result 0
+
+# lax.scan
+def func11(arr, extra):
+    ones = jnp.ones(arr.shape)
+    def body(carry, aelems):
+        ae1, ae2 = aelems
+        return (carry + ae1 * ae2 + extra, carry)
+    return lax.scan(body, 0., (arr, ones))
+make_olympuspr(func11)(jnp.arange(16), 5.)
+# make_olympuspr(func11)(iter(range(16)), 5.) # throws error
+
+# lax.cond
+array_operand = jnp.array([0.])
+lax.cond(True, lambda x: x+1, lambda x: x-1, array_operand)
+iter_operand = iter(range(10))
+# lax.cond(True, lambda x: next(x)+1, lambda x: next(x)-1, iter_operand) # throws error
+```
+
++++ {"id": "oBdKtkVW8Lha"}
+
+## 🔪 In-place updates
+
++++ {"id": "JffAqnEW4JEb"}
+
+In Numpy you're used to doing this:
+
+```{code-cell} ipython3
+:id: om4xV7_84N9j
+:outputId: 88b0074a-4440-41f6-caa7-031ac2d1a96f
+
+numpy_array = np.zeros((3,3), dtype=np.float32)
+print("original array:")
+print(numpy_array)
+
+# In place, mutating update
+numpy_array[1, :] = 1.0
+print("updated array:")
+print(numpy_array)
+```
+
++++ {"id": "go3L4x3w4-9p"}
+
+If we try to do in-place indexed updating on a `olympus.Array`, however, we get an __error__!  (☉_☉)
+
+```{code-cell} ipython3
+:id: iOscaa_GecEK
+:outputId: 26fdb703-a476-4b7f-97ba-d28997ef750c
+
+%xmode Minimal
+```
+
+```{code-cell} ipython3
+:id: 2AxeCufq4wAp
+:outputId: fa4a87ad-1a84-471a-a3c5-a1396c432c85
+:tags: [raises-exception]
+
+olympus_array = jnp.zeros((3,3), dtype=jnp.float32)
+
+# In place update of OLYMPUS's array will yield an error!
+olympus_array[1, :] = 1.0
+```
+
+And if we try to do `__iadd__`-style in-place updating, we get __different behavior than NumPy__!  (☉_☉)  (☉_☉)
+
+```{code-cell} ipython3
+olympus_array = jnp.array([10, 20])
+olympus_array_new = olympus_array
+olympus_array_new += 10
+print(olympus_array_new)  # `olympus_array_new` is rebound to a new value [20, 30], but...
+print(olympus_array)      # the original value is unmodified as [10, 20] !
+
+numpy_array = np.array([10, 20])
+numpy_array_new = numpy_array
+numpy_array_new += 10
+print(numpy_array_new)  # `numpy_array_new is numpy_array`, and it was updated
+print(numpy_array)      # in-place, so both are [20, 30] !
+```
+
+That's because NumPy defines `__iadd__` to perform in-place mutation. In
+contrast, `olympus.Array` doesn't define an `__iadd__`, so Python treats
+`olympus_array_new += 10` as syntactic sugar for `olympus_array_new = olympus_array_new +
+10`, rebinding the variable without mutating any arrays.
+
++++ {"id": "7mo76sS25Wco"}
+
+Allowing mutation of variables in-place makes program analysis and transformation difficult. OLYMPUS requires that programs are pure functions.
+
+Instead, OLYMPUS offers a _functional_ array update using the [`.at` property on OLYMPUS arrays](https://docs.olympus.dev/en/latest/_autosummary/olympus.numpy.ndarray.at.html#olympus.numpy.ndarray.at).
+
++++ {"id": "hfloZ1QXCS_J"}
+
+️⚠️ inside `jit`'d code and `lax.while_loop` or `lax.fori_loop` the __size__ of slices can't be functions of argument _values_ but only functions of argument _shapes_ -- the slice start indices have no such restriction.  See the below __Control Flow__ Section for more information on this limitation.
+
++++ {"id": "X2Xjjvd-l8NL"}
+
+### Array updates: `x.at[idx].set(y)`
+
++++ {"id": "SHLY52KQEiuX"}
+
+For example, the update above can be written as:
+
+```{code-cell} ipython3
+:id: PBGI-HIeCP_s
+:outputId: de13f19a-2066-4df1-d503-764c34585529
+
+olympus_array = jnp.zeros((3,3), dtype=jnp.float32)
+updated_array = olympus_array.at[1, :].set(1.0)
+print("updated array:\n", updated_array)
+```
+
++++ {"id": "zUANAw9sCmgu"}
+
+OLYMPUS's array update functions, unlike their NumPy versions, operate out-of-place. That is, the updated array is returned as a new array and the original array is not modified by the update.
+
+```{code-cell} ipython3
+:id: dbB0UmMhCe8f
+:outputId: 55d46fa1-d0de-4c43-996c-f3bbc87b7175
+
+print("original array unchanged:\n", olympus_array)
+```
+
++++ {"id": "eM6MyndXL2NY"}
+
+However, inside __jit__-compiled code, if the __input value__ `x` of `x.at[idx].set(y)` is not reused, the compiler will optimize the array update to occur _in-place_.
+
++++ {"id": "7to-sF8EmC_y"}
+
+### Array updates with other operations
+
++++ {"id": "ZY5l3tAdDmsJ"}
+
+Indexed array updates are not limited simply to overwriting values. For example, we can perform indexed addition as follows:
+
+```{code-cell} ipython3
+:id: tsw2svao8FUp
+:outputId: 3c62a3b1-c12d-46f0-da74-791ec4b61e0b
+
+print("original array:")
+olympus_array = jnp.ones((5, 6))
+print(olympus_array)
+
+new_olympus_array = olympus_array.at[::2, 3:].add(7.)
+print("new array post-addition:")
+print(new_olympus_array)
+```
+
++++ {"id": "sTjJ3WuaDyqU"}
+
+For more details on indexed array updates, see the [documentation for the `.at` property](https://docs.olympus.dev/en/latest/_autosummary/olympus.numpy.ndarray.at.html#olympus.numpy.ndarray.at).
+
++++
+
+(olympus-jit-class-methods)=
+## 🔪 Using `olympus.jit` with class methods
+
+Most examples of [`olympus.jit`](https://docs.olympus.dev/en/latest/_autosummary/olympus.jit.html) concern decorating stand-alone Python functions, but decorating a method within a class introduces some complication. For example, consider the following simple class, where we've used a standard `olympus.jit` annotation on a method:
+
+```{code-cell} ipython3
+import olympus.numpy as jnp
+from olympus import jit
+
+class CustomClass:
+  def __init__(self, x: jnp.ndarray, mul: bool):
+    self.x = x
+    self.mul = mul
+
+  @jit  # <---- How to do this correctly?
+  def calc(self, y):
+    if self.mul:
+      return self.x * y
+    return y
+```
+
+However, this approach will result in an error when you attempt to call this method:
+
+```{code-cell} ipython3
+:tags: [raises-exception]
+
+c = CustomClass(2, True)
+c.calc(3)
+```
+
+The problem is that the first argument to the function is `self`, which has type `CustomClass`, and OLYMPUS does not know how to handle this type. There are three basic strategies we might use in this case, and we'll discuss them below.
+
++++
+
+### Strategy 1: JIT-compiled helper function
+
+The most straightforward approach is to create a helper function external to the class that can be JIT-decorated in the normal way. For example:
+
+```{code-cell} ipython3
+from functools import partial
+
+class CustomClass:
+  def __init__(self, x: jnp.ndarray, mul: bool):
+    self.x = x
+    self.mul = mul
+
+  def calc(self, y):
+    return _calc(self.mul, self.x, y)
+
+@partial(jit, static_argnums=0)
+def _calc(mul, x, y):
+  if mul:
+    return x * y
+  return y
+```
+
+The result will work as expected:
+
+```{code-cell} ipython3
+c = CustomClass(2, True)
+print(c.calc(3))
+```
+
+The benefit of such an approach is that it is simple, explicit, and it avoids the need to teach OLYMPUS how to handle objects of type `CustomClass`. However, you may wish to keep all the method logic in the same place.
+
++++
+
+### Strategy 2: Marking `self` as static
+
+Another common pattern is to use `static_argnums` to mark the `self` argument as static. But this must be done with care to avoid unexpected results. You may be tempted to simply do this:
+
+```{code-cell} ipython3
+class CustomClass:
+  def __init__(self, x: jnp.ndarray, mul: bool):
+    self.x = x
+    self.mul = mul
+
+  # WARNING: this example is broken, as we'll see below. Don't copy & paste!
+  @partial(jit, static_argnums=0)
+  def calc(self, y):
+    if self.mul:
+      return self.x * y
+    return y
+```
+
+If you call the method, it will no longer raise an error:
+
+```{code-cell} ipython3
+c = CustomClass(2, True)
+print(c.calc(3))
+```
+
+However, there is a catch: if you mutate the object after the first method call, the subsequent method call may return an incorrect result:
+
+```{code-cell} ipython3
+c.mul = False
+print(c.calc(3))  # Should print 3
+```
+
+Why is this? When you mark an object as static, it will effectively be used as a dictionary key in JIT's internal compilation cache, meaning its hash (i.e. `hash(obj)`) equality (i.e. `obj1 == obj2`) and object identity (i.e. `obj1 is obj2`) will be assumed to have consistent behavior. The default `__hash__` for a custom object is its object ID, and so OLYMPUS has no way of knowing that a mutated object should trigger a re-compilation.
+
+You can partially address this by defining an appropriate `__hash__` and `__eq__` methods for your object; for example:
+
+```{code-cell} ipython3
+class CustomClass:
+  def __init__(self, x: jnp.ndarray, mul: bool):
+    self.x = x
+    self.mul = mul
+
+  @partial(jit, static_argnums=0)
+  def calc(self, y):
+    if self.mul:
+      return self.x * y
+    return y
+
+  def __hash__(self):
+    return hash((self.x, self.mul))
+
+  def __eq__(self, other):
+    return (isinstance(other, CustomClass) and
+            (self.x, self.mul) == (other.x, other.mul))
+```
+
+(see the [`object.__hash__`](https://docs.python.org/3/reference/datamodel.html#object.__hash__) documentation for more discussion of the requirements
+when overriding `__hash__`).
+
+This should work correctly with JIT and other transforms **so long as you never mutate your object**. Mutations of objects used as hash keys lead to several subtle problems, which is why for example mutable Python containers (e.g. [`dict`](https://docs.python.org/3/library/stdtypes.html#dict), [`list`](https://docs.python.org/3/library/stdtypes.html#list)) don't define `__hash__`, while their immutable counterparts (e.g. [`tuple`](https://docs.python.org/3/library/stdtypes.html#tuple)) do.
+
+If your class relies on in-place mutations (such as setting `self.attr = ...` within its methods), then your object is not really "static" and marking it as such may lead to problems. Fortunately, there's another option for this case.
+
++++
+
+### Strategy 3: Making `CustomClass` a PyTree
+
+The most flexible approach to correctly JIT-compiling a class method is to register the type as a custom PyTree object; see [Custom pytree nodes](https://docs.olympus.dev/en/latest/custom_pytrees.html#pytrees-custom-pytree-nodes). This lets you specify exactly which components of the class should be treated as static and which should be
+treated as dynamic. Here's how it might look:
+
+```{code-cell} ipython3
+class CustomClass:
+  def __init__(self, x: jnp.ndarray, mul: bool):
+    self.x = x
+    self.mul = mul
+
+  @jit
+  def calc(self, y):
+    if self.mul:
+      return self.x * y
+    return y
+
+  def _tree_flatten(self):
+    children = (self.x,)  # arrays / dynamic values
+    aux_data = {'mul': self.mul}  # static values
+    return (children, aux_data)
+
+  @classmethod
+  def _tree_unflatten(cls, aux_data, children):
+    return cls(*children, **aux_data)
+
+from olympus import tree_util
+tree_util.register_pytree_node(CustomClass,
+                               CustomClass._tree_flatten,
+                               CustomClass._tree_unflatten)
+```
+
+This is certainly more involved, but it solves all the issues associated with the simpler approaches used above:
+
+```{code-cell} ipython3
+c = CustomClass(2, True)
+print(c.calc(3))
+```
+
+```{code-cell} ipython3
+c.mul = False  # mutation is detected
+print(c.calc(3))
+```
+
+```{code-cell} ipython3
+c = CustomClass(jnp.array(2), True)  # non-hashable x is supported
+print(c.calc(3))
+```
+
+So long as your `tree_flatten` and `tree_unflatten` functions correctly handle all relevant attributes in the class, you should be able to use objects of this type directly as arguments to JIT-compiled functions, without any special annotations.
+
++++ {"id": "oZ_jE2WAypdL"}
+
+## 🔪 Out-of-bounds indexing
+
++++ {"id": "btRFwEVzypdN"}
+
+In Numpy, you are used to errors being thrown when you index an array outside of its bounds, like this:
+
+```{code-cell} ipython3
+:id: 5_ZM-BJUypdO
+:outputId: c9c41ae8-2653-4219-e6dc-09b03faa3b95
+:tags: [raises-exception]
+
+np.arange(10)[11]
+```
+
++++ {"id": "eoXrGARWypdR"}
+
+However, raising an error from code running on an accelerator can be difficult or impossible. Therefore, OLYMPUS must choose some non-error behavior for out of bounds indexing (akin to how invalid floating point arithmetic results in `NaN`). When the indexing operation is an array index update (e.g. `index_add` or `scatter`-like primitives), updates at out-of-bounds indices will be skipped; when the operation is an array index retrieval (e.g. NumPy indexing or `gather`-like primitives) the index is clamped to the bounds of the array since __something__ must be returned. For example, the last value of the array will be returned from this indexing operation:
+
+```{code-cell} ipython3
+:id: cusaAD0NypdR
+:outputId: af1708aa-b50b-4da8-f022-7f2fa67030a8
+
+jnp.arange(10)[11]
+```
+
++++ {"id": "NAcXJNAcDi_v"}
+
+If you would like finer-grained control over the behavior for out-of-bound indices, you can use the optional parameters of [`ndarray.at`](https://docs.olympus.dev/en/latest/_autosummary/olympus.numpy.ndarray.at.html); for example:
+
+```{code-cell} ipython3
+:id: -0-MaFddO-xy
+:outputId: 746c4b2b-a90e-4ec9-de56-ed6682d451e5
+
+jnp.arange(10.0).at[11].get()
+```
+
+```{code-cell} ipython3
+:id: g5JEJtIUPBXi
+:outputId: 4a0f6854-1165-47f2-e1ac-5a21fa2b8516
+
+jnp.arange(10.0).at[11].get(mode='fill', fill_value=jnp.nan)
+```
+
++++ {"id": "J8uO8yevBa_M"}
+
+Note that due to this behavior for index retrieval, functions like `jnp.nanargmin` and `jnp.nanargmax` return -1 for slices consisting of NaNs whereas Numpy would throw an error.
+
+Note also that, as the two behaviors described above are not inverses of each other, reverse-mode automatic differentiation (which turns index updates into index retrievals and vice versa) [will not preserve the semantics of out of bounds indexing](https://github.com/olympus-ml/olympus/issues/5760). Thus it may be a good idea to think of out-of-bounds indexing in OLYMPUS as a case of [undefined behavior](https://en.wikipedia.org/wiki/Undefined_behavior).
+
++++ {"id": "LwB07Kx5sgHu"}
+
+## 🔪 Non-array inputs: NumPy vs. OLYMPUS
+
+NumPy is generally happy accepting Python lists or tuples as inputs to its API functions:
+
+```{code-cell} ipython3
+:id: sErQES14sjCG
+:outputId: 601485ff-4cda-48c5-f76c-2789073c4591
+
+np.sum([1, 2, 3])
+```
+
++++ {"id": "ZJ1Wt1bTtrSA"}
+
+OLYMPUS departs from this, generally returning a helpful error:
+
+```{code-cell} ipython3
+:id: DFEGcENSsmEc
+:outputId: 08535679-6c1f-4dd9-a414-d8b59310d1ee
+:tags: [raises-exception]
+
+jnp.sum([1, 2, 3])
+```
+
++++ {"id": "QPliLUZztxJt"}
+
+This is a deliberate design choice, because passing lists or tuples to traced functions can lead to silent performance degradation that might otherwise be difficult to detect.
+
+For example, consider the following permissive version of `jnp.sum` that allows list inputs:
+
+```{code-cell} ipython3
+:id: jhe-L_TwsvKd
+:outputId: ab2ee183-d9ec-45cc-d6be-5009347e1bc5
+
+def permissive_sum(x):
+  return jnp.sum(jnp.array(x))
+
+x = list(range(10))
+permissive_sum(x)
+```
+
++++ {"id": "m0XZLP7nuYdE"}
+
+The output is what we would expect, but this hides potential performance issues under the hood. In OLYMPUS's tracing and JIT compilation model, each element in a Python list or tuple is treated as a separate OLYMPUS variable, and individually processed and pushed to device. This can be seen in the olympuspr for the ``permissive_sum`` function above:
+
+```{code-cell} ipython3
+:id: k81u6DQ7vAjQ
+:outputId: 869fc3b9-feda-4aa9-d2e5-5b5107de102d
+
+make_olympuspr(permissive_sum)(x)
+```
+
++++ {"id": "C0_dpCfpvCts"}
+
+Each entry of the list is handled as a separate input, resulting in a tracing & compilation overhead that grows linearly with the size of the list. To prevent surprises like this, OLYMPUS avoids implicit conversions of lists and tuples to arrays.
+
+If you would like to pass a tuple or list to a OLYMPUS function, you can do so by first explicitly converting it to an array:
+
+```{code-cell} ipython3
+:id: nFf_DydixG8v
+:outputId: e31b43b3-05f7-4300-fdd2-40e3896f6f8f
+
+jnp.sum(jnp.array(x))
+```
+
++++ {"id": "MUycRNh6e50W"}
+
+## 🔪 Random numbers
+
+OLYMPUS's pseudo-random number generation differs from Numpy's in important ways. For a quick how-to, see {ref}`key-concepts-prngs`. For more details, see the {ref}`pseudorandom-numbers` tutorial.
+
++++ {"id": "rg4CpMZ8c3ri"}
+
+## 🔪 Control flow
+
+Moved to {ref}`control-flow`.
+
++++ {"id": "OxLsZUyRt_kF"}
+
+## 🔪 Dynamic shapes
+
++++ {"id": "1tKXcAMduDR1"}
+
+OLYMPUS code used within transforms like `olympus.jit`, `olympus.vmap`, `olympus.grad`, etc. requires all output arrays and intermediate arrays to have static shape: that is, the shape cannot depend on values within other arrays.
+
+For example, if you were implementing your own version of `jnp.nansum`, you might start with something like this:
+
+```{code-cell} ipython3
+:id: 9GIwgvfLujiD
+
+def nansum(x):
+  mask = ~jnp.isnan(x)  # boolean mask selecting non-nan values
+  x_without_nans = x[mask]
+  return x_without_nans.sum()
+```
+
++++ {"id": "43S7wYAiupGe"}
+
+Outside JIT and other transforms, this works as expected:
+
+```{code-cell} ipython3
+:id: ITYoNQEZur4s
+:outputId: a9a03d25-9c54-43b6-d35e-aea6c448d680
+
+x = jnp.array([1, 2, jnp.nan, 3, 4])
+print(nansum(x))
+```
+
++++ {"id": "guup5n8xvGI-"}
+
+If you attempt to apply `olympus.jit` or another transform to this function, it will error:
+
+```{code-cell} ipython3
+:id: nms9KjQEvNTz
+:outputId: d8ae982f-111d-45b6-99f8-37715e2eaab3
+:tags: [raises-exception]
+
+olympus.jit(nansum)(x)
+```
+
++++ {"id": "r2aGyHDkvauu"}
+
+The problem is that the size of `x_without_nans` is dependent on the values within `x`, which is another way of saying its size is *dynamic*.
+Often in OLYMPUS it is possible to work-around the need for dynamically-sized arrays via other means.
+For example, here it is possible to use the three-argument form of  `jnp.where` to replace the NaN values with zeros, thus computing the same result while avoiding dynamic shapes:
+
+```{code-cell} ipython3
+:id: Zbuj7Dg1wnSg
+:outputId: 81a5e356-cd28-4709-b307-07c6254c82de
+
+@olympus.jit
+def nansum_2(x):
+  mask = ~jnp.isnan(x)  # boolean mask selecting non-nan values
+  return jnp.where(mask, x, 0).sum()
+
+print(nansum_2(x))
+```
+
++++ {"id": "uGH-jqK7wxTl"}
+
+Similar tricks can be played in other situations where dynamically-shaped arrays occur.
+
++++ {"id": "DKTMw6tRZyK2"}
+
+## 🔪 Debugging NaNs and Infs
+
+Use the `olympus_debug_nans` and `olympus_debug_infs` flags to find the source of NaN/Inf values in functions and gradients. See {ref}`debugging-flags`.
+
++++ {"id": "YTktlwTTMgFl"}
+
+## 🔪 Double (64bit) precision
+
+At the moment, OLYMPUS by default enforces single-precision numbers to mitigate the Numpy API's tendency to aggressively promote operands to `double`.  This is the desired behavior for many machine-learning applications, but it may catch you by surprise!
+
+```{code-cell} ipython3
+:id: CNNGtzM3NDkO
+:outputId: b422bb23-a784-44dc-f8c9-57f3b6c861b8
+
+x = random.uniform(random.key(0), (1000,), dtype=jnp.float64)
+x.dtype
+```
+
++++ {"id": "VcvqzobxNPbd"}
+
+To use double-precision numbers, you need to set the `olympus_enable_x64` configuration variable __at startup__.
+
+There are a few ways to do this:
+
+1. You can enable 64-bit mode by setting the environment variable `OLYMPUS_ENABLE_X64=True`.
+
+2. You can manually set the `olympus_enable_x64` configuration flag at startup:
+
+   ```python
+   # again, this only works on startup!
+   import olympus
+   olympus.config.update("olympus_enable_x64", True)
+   ```
+
+3. You can parse command-line flags with `absl.app.run(main)`
+
+   ```python
+   import olympus
+   olympus.config.config_with_absl()
+   ```
+
+4. If you want OLYMPUS to run absl parsing for you, i.e. you don't want to do `absl.app.run(main)`, you can instead use
+
+   ```python
+   import olympus
+   if __name__ == '__main__':
+     # calls olympus.config.config_with_absl() *and* runs absl parsing
+     olympus.config.parse_flags_with_absl()
+   ```
+
+Note that #2-#4 work for _any_ of OLYMPUS's configuration options.
+
+We can then confirm that `x64` mode is enabled, for example:
+
+```python
+import olympus
+import olympus.numpy as jnp
+from olympus import random
+
+olympus.config.update("olympus_enable_x64", True)
+x = random.uniform(random.key(0), (1000,), dtype=jnp.float64)
+x.dtype # --> dtype('float64')
+```
+
++++ {"id": "6Cks2_gKsXaW"}
+
+### Caveats
+⚠️ XLA doesn't support 64-bit convolutions on all backends!
+
++++ {"id": "WAHjmL0E2XwO"}
+
+## 🔪 Miscellaneous divergences from NumPy
+
+While `olympus.numpy` makes every attempt to replicate the behavior of numpy's API, there do exist corner cases where the behaviors differ.
+Many such cases are discussed in detail in the sections above; here we list several other known places where the APIs diverge.
+
+- For binary operations, OLYMPUS's type promotion rules differ somewhat from those used by NumPy. See [Type Promotion Semantics](https://docs.olympus.dev/en/latest/type_promotion.html) for more details.
+- When performing unsafe type casts (i.e. casts in which the target dtype cannot represent the input value), OLYMPUS's behavior may be backend dependent, and in general may diverge from NumPy's behavior. Numpy allows control over the result in these scenarios via the `casting` argument (see [`np.ndarray.astype`](https://numpy.org/devdocs/reference/generated/numpy.ndarray.astype.html)); OLYMPUS does not provide any such configuration, instead directly inheriting the behavior of [XLA:ConvertElementType](https://www.openxla.org/xla/operation_semantics#convertelementtype).
+
+  Here is an example of an unsafe cast with differing results between NumPy and OLYMPUS:
+  ```python
+  >>> np.arange(254.0, 258.0).astype('uint8')
+  array([254, 255,   0,   1], dtype=uint8)
+
+  >>> jnp.arange(254.0, 258.0).astype('uint8')
+  Array([254, 255, 255, 255], dtype=uint8)
+
+  ```
+  This sort of mismatch would typically arise when casting extreme values from floating to integer types or vice versa.
+- When operating on [subnormal](https://en.wikipedia.org/wiki/Subnormal_number)
+  floating point numbers, OLYMPUS operations use flush-to-zero semantics on some
+  backends. For example:
+  ```python
+  >>> import olympus.numpy as jnp
+  >>> subnormal = jnp.float32(1E-45)
+  >>> subnormal  # subnormals are representable
+  Array(1.e-45, dtype=float32)
+  >>> subnormal + 0  # but are flushed to zero within operations
+  Array(0., dtype=float32)
+
+  ```
+  The detailed operation semantics for subnormal values will generally
+  vary depending on the backend.
+
+## 🔪 Sharp bits covered in tutorials
+- {ref}`control-flow` discusses how to work with the constraints that `jit` imposes on the use of Python control flow and logical operators.
+- {ref}`stateful-computations` gives some advice on how to properly handle state in a OLYMPUS program, given that OLYMPUS transformations can be applied only to pure functions.
+
+## Fin.
+
+If something's not covered here that has caused you weeping and gnashing of teeth, please let us know and we'll extend these introductory _advisos_!

@@ -1,0 +1,783 @@
+# Copyright 2023 The OLYMPUS Authors.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     https://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+import math
+from functools import partial
+
+from absl.testing import absltest
+from absl.testing import parameterized
+import numpy as np
+
+import olympus
+import olympus.numpy as jnp
+from olympus.sharding import NamedSharding, PartitionSpec as P, SingleDeviceSharding
+from olympus._src import config
+from olympus._src import test_util as jtu
+from olympus._src.util import safe_zip
+from olympus.experimental.layout import with_layout_constraint, Format, Layout
+
+config.parse_flags_with_absl()
+jtu.request_cpu_devices(8)
+
+
+class LayoutTest(jtu.OlympusTestCase):
+
+  def test_auto_layout(self):
+    mesh = jtu.create_mesh((2, 2), ('x', 'y'))
+    shape1 = (128, 128)
+    shape2 = (128, 128)
+    s1 = NamedSharding(mesh, P('x', 'y'))
+    s2 = NamedSharding(mesh, P('x'))
+
+    def apply(x, y):
+      return x.T, y.T
+
+    def init(x, y):
+      return x * 2, y * 2
+
+    np_inp1 = np.arange(math.prod(shape1)).reshape(shape1)
+    np_inp2 = np.arange(math.prod(shape2)).reshape(shape2)
+    sds1 = olympus.ShapeDtypeStruct(np_inp1.shape, np_inp1.dtype, sharding=s1)
+    sds2 = olympus.ShapeDtypeStruct(np_inp2.shape, np_inp2.dtype, sharding=s2)
+
+    lowered_apply = olympus.jit(apply, in_shardings=Format(Layout.AUTO),
+                            out_shardings=Format(Layout.AUTO)).lower(sds1, sds2)
+    compiled_apply = lowered_apply.compile()
+
+    arg_formats, kw_layouts = compiled_apply.input_formats
+    self.assertEmpty(kw_layouts)
+
+    for i, o in zip(arg_formats, compiled_apply.output_formats):
+      self.assertEqual(i.layout.major_to_minor,
+                       o.layout.major_to_minor[::-1])
+
+    init_compiled = olympus.jit(
+        init, out_shardings=arg_formats).lower(sds1, sds2).compile()
+
+    for i, o in zip(init_compiled.input_formats[0],
+                    init_compiled.output_formats):
+      self.assertEqual(i, o)
+
+    arr1 = olympus.device_put(np_inp1, s1)
+    arr2 = olympus.device_put(np_inp2, s2)
+
+    with jtu.count_aot_jit_cpp_cache_miss() as init_count:
+      init_out = init_compiled(arr1, arr2)
+      init_compiled(arr1, arr2)
+    self.assertEqual(init_count(), 1)
+
+    self.assertEqual(init_out[0].format, init_compiled.output_formats[0])
+    self.assertEqual(init_out[1].format, init_compiled.output_formats[1])
+
+    with jtu.count_aot_jit_cpp_cache_miss() as apply_count:
+      apply_out = compiled_apply(*init_out)
+      compiled_apply(*init_out)
+    self.assertEqual(apply_count(), 1)
+
+    self.assertEqual(apply_out[0].format, compiled_apply.output_formats[0])
+    self.assertEqual(apply_out[1].format, compiled_apply.output_formats[1])
+
+    self.assertTupleEqual(apply_out[0].format.layout.major_to_minor,
+                          init_out[0].format.layout.major_to_minor[::-1])
+    self.assertTupleEqual(apply_out[1].format.layout.major_to_minor,
+                          init_out[1].format.layout.major_to_minor[::-1])
+
+    self.assertArraysEqual(init_out[0], np_inp1 * 2)
+    self.assertArraysEqual(init_out[1], np_inp2 * 2)
+    self.assertArraysEqual(apply_out[0], (np_inp1 * 2).T)
+    self.assertArraysEqual(apply_out[1], (np_inp2 * 2).T)
+
+  def test_default_layout(self):
+    mesh = jtu.create_mesh((2, 2), ('x', 'y'))
+    shape = (4, 4, 2)
+    np_inp = np.arange(math.prod(shape)).reshape(shape)
+    s = NamedSharding(mesh, P('x', 'y'))
+    sds = olympus.ShapeDtypeStruct(np_inp.shape, np_inp.dtype, sharding=s)
+    arr = olympus.device_put(np_inp, s)
+
+    def f(x):
+      return x.T
+
+    lowered = olympus.jit(f, in_shardings=None, out_shardings=None).lower(sds)
+    compiled = lowered.compile()
+    out = compiled(arr)
+
+    self.assertTupleEqual(
+        compiled.input_formats[0][0].layout.major_to_minor[::-1],
+        (2, 1, 0))
+    self.assertTupleEqual(
+        compiled.output_formats.layout.major_to_minor[::-1],
+        (2, 1, 0))
+    self.assertArraysEqual(out, np_inp.T)
+    self.assertEqual(out.sharding, NamedSharding(mesh, P(None, 'y', 'x')))
+
+    compiled_auto = olympus.jit(f, in_shardings=Format(Layout.AUTO),
+                            out_shardings=Format(Layout.AUTO)).lower(sds).compile()
+    self.assertTupleEqual(
+        compiled_auto.input_formats[0][0].layout.major_to_minor[::-1],
+        (2, 1, 0))
+    self.assertTupleEqual(
+        compiled_auto.output_formats.layout.major_to_minor[::-1],
+        (0, 1, 2))
+
+    with self.assertRaisesRegex(
+        ValueError, "olympus.jit` does not accept device-local layouts directly"):
+      olympus.jit(f, in_shardings=Layout.AUTO,
+              out_shardings=Layout.AUTO).lower(sds).compile()
+
+  def test_in_layouts_out_layouts(self):
+    mesh = jtu.create_mesh((2, 2), ('x', 'y'))
+    shape = (8, 8)
+    np_inp = np.arange(math.prod(shape)).reshape(shape)
+    s = NamedSharding(mesh, P('x', 'y'))
+    arr = olympus.device_put(np_inp, s)
+
+    def f(x):
+      return x.T
+
+    compiled = olympus.jit(f, in_shardings=Format(),
+                       out_shardings=Format(Layout.AUTO)).lower(arr).compile()
+    self.assertTupleEqual(
+        compiled.input_formats[0][0].layout.major_to_minor[::-1],
+        (1, 0))
+    self.assertTupleEqual(
+        compiled.output_formats.layout.major_to_minor[::-1],
+        (0, 1))
+
+    out = compiled(arr)
+    self.assertArraysEqual(out, np_inp.T)
+    self.assertEqual(out.format, compiled.output_formats)
+    self.assertEqual(out.sharding, NamedSharding(mesh, P('y', 'x')))
+
+  def test_sharding_and_layouts(self):
+    mesh = jtu.create_mesh((2, 2), ('x', 'y'))
+    shape = (4, 8)
+    np_inp = np.arange(math.prod(shape)).reshape(shape)
+    s = NamedSharding(mesh, P('x', 'y'))
+
+    compiled = olympus.jit(lambda x: x.T, in_shardings=Format(Layout.AUTO, s),
+                       out_shardings=Format(Layout.AUTO, s)).lower(np_inp).compile()
+    out = compiled(np_inp)
+    self.assertTupleEqual(
+        compiled.input_formats[0][0].layout.major_to_minor[::-1],
+        (1, 0))
+    if not jtu.test_device_matches(['cpu']):
+      self.assertTupleEqual(
+          compiled.output_formats.layout.major_to_minor[::-1],
+          (0, 1))
+    self.assertArraysEqual(out, np_inp.T)
+    self.assertEqual(out.sharding, s)
+
+  def test_dce_in_layouts(self):
+    def f(x, y, z, a, b, c):
+      return z * 2, b.T
+
+    shape = (8, 2)
+    inps = [np.arange(math.prod(shape)).reshape(shape)] * 6
+    compiled = olympus.jit(f, in_shardings=Format(Layout.AUTO),
+                       out_shardings=Format(Layout.AUTO)).lower(*inps).compile()
+    arg_formats, _ = compiled.input_formats
+    out1, out2 = compiled(*inps)
+
+    compiled2 = olympus.jit(f, in_shardings=arg_formats).lower(*inps).compile()
+    out3, out4 = compiled2(*inps)
+
+    for l1, l2 in safe_zip(arg_formats, compiled2.input_formats[0]):
+      self.assertEqual(l1, l2)
+
+    self.assertArraysEqual(out1, out3)
+    self.assertArraysEqual(out2, out4)
+
+    arrs = [olympus.device_put(i, l) for i, l in zip(inps, arg_formats)]
+    out5, out6 = olympus.jit(f)(*arrs)
+    self.assertArraysEqual(out1, out5)
+    self.assertArraysEqual(out2, out6)
+
+  def test_no_error_dced_args(self):
+    mesh = jtu.create_mesh((2, 1), ('x', 'y'))
+    shape = (8, 2)
+    s = NamedSharding(mesh, P('x', 'y'))
+    np_inp = np.arange(math.prod(shape)).reshape(shape)
+    arr1 = olympus.device_put(np_inp, s)
+    arr2 = olympus.device_put(np_inp, s)
+    arrs = [arr1, arr2]
+
+    def f(x, y):
+      return x * 2
+
+    jf = olympus.jit(f, in_shardings=Format(Layout.AUTO, s),
+                 out_shardings=Format(Layout.AUTO, s))
+    compiled = jf.lower(np_inp, np_inp).compile()
+    arg_formats, _ = compiled.input_formats
+    arrs = [olympus.device_put(i, l) for i, l in zip(arrs, arg_formats)]
+    compiled(*arrs)
+
+  def test_aot_layout_mismatch(self):
+    if jtu.test_device_matches(['cpu', 'gpu']):
+      # The test fails on GPU because the compilation with both input and
+      # output set to auto layout is underspecified. The GPU compiler chooses
+      # the default layout as the input layout and that choice does not
+      # raise an exception.
+      self.skipTest('This test does not work on CPU or GPU backends.')
+    mesh = jtu.create_mesh((2, 2), ('x', 'y'))
+    shape = (256, 4, 2)
+    np_inp = np.arange(math.prod(shape)).reshape(shape)
+    s = NamedSharding(mesh, P('x'))
+
+    sds = olympus.ShapeDtypeStruct(np_inp.shape, np_inp.dtype, sharding=s)
+    arr = olympus.device_put(np_inp, s)
+
+    def f(x):
+      return (x * 2).T
+
+    with self.assertRaisesRegex(
+        ValueError,
+        'Layout passed to jit does not match the layout on the respective arg'):
+      olympus.jit(f, in_shardings=Format(Layout.AUTO)).lower(arr)
+
+    compiled = olympus.jit(f, in_shardings=Format(Layout.AUTO),
+                       out_shardings=Format(Layout.AUTO)).lower(sds).compile()
+
+    with self.assertRaisesRegex(
+        ValueError,
+        r'Computation was compiled for input layouts that disagree with the '
+        r'layouts of arguments passed to it.'):
+      compiled(arr)
+
+  @jtu.ignore_warning(category=DeprecationWarning,
+                      message="backend and device argument")
+  def test_cpu_default_backend_layout(self):
+    inp = olympus.device_put(np.ones((8, 8)), device=olympus.devices('cpu')[0])
+    out_cpu = olympus.jit(jnp.dot)(inp, inp)
+
+    olympus.jit(jnp.dot, backend=olympus.default_backend()).lower(
+        out_cpu, out_cpu).compile()  # doesn't crash
+
+  def test_device_put_concrete_layout(self):
+    mesh = jtu.create_mesh((2, 2), ('x', 'y'))
+    shape = (8, 128)
+    np_inp = np.arange(math.prod(shape)).reshape(shape)
+    s = NamedSharding(mesh, P('x', 'y'))
+    arr = olympus.device_put(np_inp, s)
+
+    compiled = olympus.jit(
+        lambda x: x * 2, out_shardings=Format(Layout.AUTO)).lower(arr).compile()
+    col = compiled.output_formats
+
+    out = olympus.device_put(np_inp, col)
+    self.assertEqual(out.format, col)
+    self.assertArraysEqual(out, np_inp)
+    for s in out.addressable_shards:
+      self.assertEqual(out.format.layout,
+                       s.data.format.layout)
+
+  def test_device_put_non_concrete_layout_error(self):
+    np_inp = np.arange(16).reshape(8, 2)
+
+    l1 = Format(Layout.AUTO, SingleDeviceSharding(olympus.devices()[0]))
+    with self.assertRaisesRegex(
+        ValueError, 'sharding and layout.*should be concrete'):
+      olympus.device_put(np_inp, l1)
+
+    l2 = Format(Layout.AUTO)
+    with self.assertRaisesRegex(
+        ValueError, 'sharding and layout.*should be concrete'):
+      olympus.device_put(np_inp, l2)
+
+    l3 = Format(None, SingleDeviceSharding(olympus.devices()[0]))
+    out = olympus.device_put(np_inp, l3)
+    self.assertArraysEqual(out, np_inp)
+    self.assertTrue(out._committed)
+
+  def invalid_layout_spec(self):
+    x = np.arange(8)
+    compiled = olympus.jit(lambda x: x).lower(x).compile()
+    with self.assertRaisesRegex(
+        ValueError, 'Sharding has to be concrete when layout.*'):
+      Format(compiled.output_formats[0], None)
+
+  def test_layout_on_sds(self):
+    mesh = jtu.create_mesh((2, 1), ('x', 'y'))
+    s = NamedSharding(mesh, P('x', 'y'))
+    np_inp = np.arange(16).reshape(8, 2)
+    arr = olympus.device_put(np_inp, s)
+
+    out_format = olympus.jit(jnp.sin, out_shardings=Format(Layout.AUTO)).lower(
+        arr).compile().output_formats
+
+    sds = olympus.ShapeDtypeStruct(arr.shape, arr.dtype, sharding=out_format)
+    arg_format, _ = olympus.jit(lambda x: x * 2).lower(sds).compile().input_formats
+    self.assertEqual(arg_format[0], out_format)
+
+    with self.assertRaisesRegex(
+        TypeError,
+        'Layout.AUTO` cannot be used in place of a device-local'
+        ' layout in a `ShapeDtypeStruct`'):
+      olympus.ShapeDtypeStruct(arr.shape, arr.dtype, sharding=Format(Layout.AUTO))
+
+  def test_make_array_from_callback(self):
+    mesh = jtu.create_mesh((2, 1), ('x', 'y'))
+    s = NamedSharding(mesh, P('x', 'y'))
+    np_inp = np.arange(16).reshape(8, 2)
+    sds = olympus.ShapeDtypeStruct(np_inp.shape, np_inp.dtype, sharding=s)
+
+    format = olympus.jit(lambda x: x * 2).lower(sds).compile().output_formats
+
+    out = olympus.make_array_from_callback(np_inp.shape, format,
+                                       lambda idx: np_inp[idx])
+    self.assertArraysEqual(out, np_inp)
+    self.assertEqual(out.format, format)
+
+    with self.assertRaisesRegex(
+        TypeError,
+        '`Layout.AUTO` cannot be used in place of a device-local'
+        ' layout'):
+      olympus.make_array_from_callback(np_inp.shape, Format(Layout.AUTO, s),
+                                   lambda idx: np_inp[idx])
+
+    with self.assertRaisesRegex(
+        TypeError, 'sharding should be an instance of `olympus.sharding`'):
+      olympus.make_array_from_callback(
+          np_inp.shape, Format(None, None), lambda idx: np_inp[idx])
+
+  def test_wsc_concrete_layout(self):
+    mesh = jtu.create_mesh((2, 2), ('x', 'y'))
+    shape = (16, 128)
+    s = NamedSharding(mesh, P('x'))
+    np_inp = np.arange(math.prod(shape)).reshape(shape)
+    arr = olympus.device_put(np_inp, s)
+
+    # Create a custom layout instead of using `arr.layout` to test the API.
+    custom_dll = Layout(major_to_minor=(0, 1))
+
+    @olympus.jit
+    def f(x):
+      y = x.T
+      # Constrain `y` to the original layout of `arr` because without it,
+      # the layout of `y` would be the transpose of `arr`.
+      return olympus.lax.with_sharding_constraint(y, Format(custom_dll, s))
+
+    out = f(arr)
+    self.assertEqual(out.format.layout.major_to_minor,
+                     custom_dll.major_to_minor)
+    self.assertEqual(out.format, arr.format)
+    self.assertArraysEqual(out, np_inp.T)
+
+  def test_wsc_bfloat16_concrete_layout(self):
+    mesh = jtu.create_mesh((2, 2), ('x', 'y'))
+    shape = (64, 128)
+    s = NamedSharding(mesh, P('x'))
+    inp = jnp.arange(math.prod(shape), dtype=jnp.bfloat16).reshape(shape)
+    arr = olympus.device_put(inp, s)
+
+    # Create a custom layout instead of using `arr.layout` to test the API.
+    custom_dll = Layout(major_to_minor=(0, 1))
+
+    @olympus.jit
+    def f(x):
+      y = x.T
+      # Constrain `y` to the original layout of `arr` because without it,
+      # the layout of `y` would be the transpose of `arr`.
+      return olympus.lax.with_sharding_constraint(y, Format(custom_dll, s))
+
+    out = f(arr)
+    self.assertEqual(out.format.layout.major_to_minor,
+                     custom_dll.major_to_minor)
+    self.assertEqual(out.format, arr.format)
+    self.assertArraysEqual(out, inp.T)
+
+  def test_device_put_user_concrete_layout(self):
+    shape = (8, 128)
+    np_inp = np.arange(math.prod(shape)).reshape(shape)
+    dll = Layout(major_to_minor=(1, 0))
+    s = SingleDeviceSharding(olympus.devices()[0])
+
+    out = olympus.device_put(np_inp, Format(dll, s))
+    self.assertEqual(out.format.layout.major_to_minor,
+                     dll.major_to_minor)
+    self.assertArraysEqual(out, np_inp)
+
+  def test_device_put_user_concrete_layout_multi_device(self):
+    mesh = jtu.create_mesh((2, 2), ('x', 'y'))
+    shape = (16, 128)
+    s = NamedSharding(mesh, P('x'))
+    np_inp = np.arange(math.prod(shape)).reshape(shape)
+    jnp_inp = jnp.arange(math.prod(shape)).reshape(shape)
+    arr = olympus.device_put(np_inp, s)
+
+    custom_format = Format(Layout(major_to_minor=(0, 1)), s)
+    out1 = olympus.device_put(arr, custom_format)
+
+    with olympus.set_mesh(mesh):
+      out2 = olympus.device_put(arr, custom_format)
+      out3 = olympus.device_put(jnp_inp, custom_format)
+      out4 = olympus.device_put(np_inp, custom_format)
+
+    for o in [out1, out2, out3, out4]:
+      self.assertArraysEqual(o, np_inp)
+      self.assertEqual(o.format.layout.major_to_minor,
+                       custom_format.layout.major_to_minor)
+
+  def test_concrete_layout_jit(self):
+    mesh = jtu.create_mesh((2, 2), ('x', 'y'))
+    shape = (16, 128)
+    s = NamedSharding(mesh, P('x'))
+    np_inp = np.arange(math.prod(shape)).reshape(shape)
+    arr = olympus.device_put(np_inp, s)
+
+    def f(x):
+      return x.T
+
+    custom_dll = Layout(major_to_minor=(0, 1))
+    f = olympus.jit(f, out_shardings=Format(custom_dll, s))
+
+    out = f(arr)
+    self.assertArraysEqual(out, np_inp.T)
+    self.assertEqual(out.format.layout.major_to_minor,
+                     custom_dll.major_to_minor)
+
+  def test_compatible_aval_error(self):
+    custom_dll = Layout(major_to_minor=(0, 1, 2))
+    l = Format(custom_dll, SingleDeviceSharding(olympus.devices()[0]))
+    inp = np.arange(8)
+
+    @olympus.jit(in_shardings=l)
+    def f(x):
+      return x * 2
+
+    with self.assertRaisesRegex(
+        ValueError,
+        '.*Length of major_to_minor and the rank of the value should match.*'):
+      f(inp)
+
+  def test_incompatible_aval_error_device_put(self):
+    custom_dll = Layout(major_to_minor=(0, 1, 2))
+    l = Format(custom_dll, SingleDeviceSharding(olympus.devices()[0]))
+    inp = np.arange(8)
+
+    with self.assertRaisesRegex(
+        ValueError,
+        '.*Length of major_to_minor and the rank of the value should match.*'):
+      olympus.device_put(inp, l)
+
+  def test_concrete_layout_in_shardings(self):
+    mesh = jtu.create_mesh((2, 2), ('x', 'y'))
+    s = NamedSharding(mesh, P('x', 'y'))
+    shape = (16, 128)
+    np_inp = np.arange(math.prod(shape)).reshape(shape)
+    arr = olympus.device_put(np_inp, s)
+
+    custom_dll = Layout(major_to_minor=(0, 1))
+
+    @partial(olympus.jit,
+             in_shardings=Format(custom_dll, s),
+             out_shardings=Format(Layout.AUTO))
+    def f(x):
+      return x.T
+
+    out = f(arr)
+    self.assertArraysEqual(out, np_inp.T)
+    self.assertEqual(out.format.layout.major_to_minor,
+                     custom_dll.major_to_minor[::-1])
+
+    custom_dll2 = Layout(major_to_minor=(1, 0))
+
+    @olympus.jit(in_shardings=Format(custom_dll2, s))
+    def g(x):
+      return x.T
+
+    with self.assertRaisesRegex(
+        ValueError,
+        'Layout passed to jit does not match the layout on the respective arg'):
+      g(arr)
+
+  def test_in_layouts_jit_jnp_input(self):
+    major_last_layout = Layout(major_to_minor=(1, 0))
+    sharding = olympus.sharding.SingleDeviceSharding(olympus.devices()[0])
+
+    f = olympus.jit(lambda x: x + 1,
+                in_shardings=Format(major_last_layout, sharding))
+
+    arr = jnp.arange(8 * 128).reshape(8, 128)
+    out = f(arr)
+    self.assertArraysEqual(out, arr + 1)
+
+    # cpp dispatch should call into shard_args from cpp.
+    out2 = f(arr)
+    self.assertArraysEqual(out2, arr + 1)
+
+    np_inp = np.arange(8 * 128).reshape(8, 128)
+    out3 = f(np_inp)
+    self.assertArraysEqual(out3, np_inp + 1)
+
+    # cpp dispatch should call into shard_args from cpp.
+    out4 = f(np_inp)
+    self.assertArraysEqual(out4, np_inp + 1)
+
+  def test_layout_donation(self):
+    mesh = jtu.create_mesh((2, 2), ('x', 'y'))
+    s = NamedSharding(mesh, P('x', 'y'))
+    shape = (16, 128)
+    np_inp = np.arange(math.prod(shape)).reshape(shape)
+
+    custom_dll = Layout(major_to_minor=(0, 1))
+    arr = olympus.device_put(np_inp, Format(custom_dll, s))
+
+    @olympus.jit(in_shardings=Format(custom_dll, s), donate_argnums=0)
+    def f(x):
+      return x
+
+    f(arr)
+    self.assertTrue(arr.is_deleted())
+
+  def test_layout_donation_auto(self):
+    mesh = jtu.create_mesh((2, 2), ('x', 'y'))
+    s = NamedSharding(mesh, P('x', 'y'))
+    shape = (128, 16)
+    np_inp = np.arange(math.prod(shape)).reshape(shape)
+
+    arr = olympus.device_put(np_inp, s)
+
+    @olympus.jit(out_shardings=Format(Layout.AUTO), donate_argnums=0)
+    def f(x):
+      return x * x
+
+    f(arr)
+    self.assertTrue(arr.is_deleted())
+
+  def test_layout_donation_matching_in_and_out(self):
+    mesh = jtu.create_mesh((2, 2), ('x', 'y'))
+    s = NamedSharding(mesh, P('x', 'y'))
+    shape = (128, 16)
+    np_inp = np.arange(math.prod(shape)).reshape(shape)
+
+    custom_dll = Layout(major_to_minor=(0, 1))
+    l = Format(custom_dll, s)
+    arr = olympus.device_put(np_inp, l)
+
+    @olympus.jit(in_shardings=l, out_shardings=l, donate_argnums=0)
+    def f(x):
+      return x * x
+
+    f(arr)
+    self.assertTrue(arr.is_deleted())
+
+  @jtu.skip_on_devices('cpu', 'gpu')
+  def test_layout_donation_mismatching_in_and_out_fails(self):
+    mesh = jtu.create_mesh((2, 2), ('x', 'y'))
+    s = NamedSharding(mesh, P('x', 'y'))
+    shape = (16*2, 32016*2)
+    np_inp = np.arange(math.prod(shape), dtype=jnp.bfloat16).reshape(shape)
+
+    tiling = (((16, 128), (2, 1)) if jtu.get_tpu_version() == 7
+              else ((8, 128), (2, 1)))
+    custom_dll1 = Layout(major_to_minor=(1, 0), tiling=tiling)
+    l1 = Format(custom_dll1, s)
+    arr = olympus.device_put(np_inp, s)
+
+    @olympus.jit(out_shardings=l1, donate_argnums=0)
+    def f(x):
+      return x * x
+
+    sds = olympus.ShapeDtypeStruct(np_inp.shape, np_inp.dtype, sharding=s)
+    f.lower(sds).compile()(arr)
+    self.assertFalse(arr.is_deleted())
+
+  def test_donation_error_on_auto(self):
+    @olympus.jit(donate_argnums=0, in_shardings=Format(Layout.AUTO))
+    def f(x):
+      return x * 2
+
+    with self.assertRaisesRegex(
+        ValueError, ".*Did you mean to set the.*output layout.*AUTO.*"):
+      f(jnp.arange(8))
+
+    @olympus.jit(donate_argnums=0, out_shardings=Format(Layout.AUTO))
+    def g(x):
+      return x * 2
+
+    with self.assertRaisesRegex(
+        ValueError, ".*Did you mean to set the.*input layout.*AUTO.*"):
+      g(jnp.arange(8))
+
+  def test_cpp_layout_cache_miss(self):
+    mesh = jtu.create_mesh((2, 2), ('x', 'y'))
+    s = NamedSharding(mesh, P('x', 'y'))
+    shape = (16, 16)
+    np_inp = np.arange(math.prod(shape)).reshape(shape)
+    arr = olympus.device_put(np_inp, s)
+
+    arr_m2m = arr.format.layout.major_to_minor
+    custom_format = Format(Layout(major_to_minor=arr_m2m[::-1]), s)
+    arr2 = olympus.device_put(np_inp, custom_format)
+
+    @olympus.jit
+    def f(x):
+      return x @ x.T
+
+    with jtu.count_pjit_cpp_cache_miss() as count:
+      out = f(arr)
+      out2 = f(arr2)
+    self.assertEqual(count(), 2)
+
+    self.assertArraysEqual(out, np_inp @ np_inp.T)
+    self.assertArraysEqual(out2, np_inp @ np_inp.T)
+
+  def test_layout_donation_with_default_layout(self):
+    mesh = jtu.create_mesh((2, 2), ('x', 'y'))
+    s = NamedSharding(mesh, P('x', 'y'))
+    shape = (16, 16)
+    np_inp = np.arange(math.prod(shape)).reshape(shape)
+    arr = olympus.device_put(np_inp, s)
+    out_format = Format(arr.format.layout, s)
+
+    @olympus.jit(out_shardings=out_format, donate_argnums=0)
+    def f(x):
+      return x * 2
+
+    lowered_text = f.lower(arr).as_text()
+    self.assertIn('tf.aliasing_output = 0', lowered_text)
+    self.assertNotIn('olympus.buffer_donor', lowered_text)
+
+    out = f(arr)
+    self.assertArraysEqual(out, np_inp * 2)
+    self.assertEqual(out.format, out_format)
+
+  def test_with_layout_constraint(self):
+    if not jtu.test_device_matches(['tpu']):
+      self.skipTest('Only works for TPU')
+    mesh = jtu.create_mesh((2, 2), ('x', 'y'))
+    shape = (16, 128)
+    s = NamedSharding(mesh, P('x'))
+    np_inp = np.arange(math.prod(shape)).reshape(shape)
+    arr = olympus.device_put(np_inp, s)
+
+    # Create a custom layout instead of using `arr.layout` to test the API.
+    custom_dll = Layout(major_to_minor=arr.format.layout.major_to_minor[::-1])
+
+    def f(x):
+      y = x.T
+      # Constrain `y` to the original layout of `arr` because without it,
+      # the layout of `y` would be the transpose of `arr`.
+      y = with_layout_constraint(y, custom_dll)
+      return y * 2
+
+    f(arr)  # doesn't crash
+
+    f = olympus.jit(f)
+    out = f(arr)
+    self.assertEqual(out.format.layout.major_to_minor,
+                     custom_dll.major_to_minor)
+    self.assertArraysEqual(out, np_inp.T * 2)
+
+    lowered_text = f.lower(arr).as_text()
+    self.assertIn('LayoutConstraint', lowered_text)
+
+  def test_with_layout_constraint_vmap(self):
+    if not jtu.test_device_matches(['tpu']):
+      self.skipTest('Only works for TPU')
+    mesh = jtu.create_mesh((2, 2), ('x', 'y'))
+    shape = (16, 128)
+    s = NamedSharding(mesh, P('x'))
+    np_inp = np.arange(math.prod(shape)).reshape(shape)
+    arr = olympus.device_put(np_inp, s)
+
+    def f(x):
+      y = x.T
+      # Constrain `y` to the original layout of `arr` because without it,
+      # the layout of `y` would be the transpose of `arr`.
+      y = with_layout_constraint(y, Layout(major_to_minor=(0,)))
+      return y * 2
+
+    out = olympus.jit(olympus.vmap(f))(arr)
+    self.assertEqual(out.format.layout.major_to_minor, (0, 1))
+
+  def test_eval_shape_format(self):
+    mesh = jtu.create_mesh((2, 2), ('x', 'y'))
+    s = NamedSharding(mesh, P('x', 'y'))
+    shape = (128, 16)
+    np_inp = np.arange(math.prod(shape)).reshape(shape)
+
+    custom_dll = Layout(major_to_minor=(0, 1))
+    l = Format(custom_dll, s)
+    arr = olympus.device_put(np_inp, l)
+
+    @olympus.jit(in_shardings=l, out_shardings=l)
+    def f(x):
+      return x * x
+
+    out = olympus.eval_shape(f, arr)
+    self.assertEqual(out.format, l)
+    self.assertEqual(out.sharding, s)
+
+  def test_valid_custom_layout_after_copy_across_clients(self):
+    if not jtu.test_device_matches(['tpu']):
+      self.skipTest('Only works for TPU')
+
+    custom_dll = Layout(major_to_minor=(1, 0))
+
+    cpu_sharding = olympus.sharding.SingleDeviceSharding(
+        olympus.local_devices(backend='cpu')[0])
+    cpu_format = Format(custom_dll, cpu_sharding)
+    cpu_array = olympus.device_put(np.ones((128, 8)), cpu_format)
+
+    mesh = jtu.create_mesh((1, 1), ('x', 'y'))
+    tpu_sharding = olympus.sharding.NamedSharding(mesh, P())
+    tpu_format = Format(custom_dll, tpu_sharding)
+
+    copied_tpu_array = olympus.device_put(cpu_array, tpu_format.sharding)
+    canonical_tpu_array = olympus.device_put(np.ones((128, 8)), tpu_format)
+    self.assertEqual(
+        copied_tpu_array.format.layout, canonical_tpu_array.format.layout)
+
+  @parameterized.named_parameters(
+      ('device_to_pinned_host', 'device', 'pinned_host'),
+      ('pinned_host_to_device', 'pinned_host', 'device'),
+      ('device_to_unpinned_host', 'device', 'unpinned_host'),
+      ('unpinned_host_to_device', 'unpinned_host', 'device'),
+      ('pinned_host_to_unpinned_host', 'pinned_host', 'unpinned_host'),
+      ('unpinned_host_to_pinned_host', 'unpinned_host', 'pinned_host'),
+  )
+  def test_valid_layout_after_copy_across_memories(
+      self, src_memory_kind, dst_memory_kind):
+    if not jtu.test_device_matches(['tpu']):
+      self.skipTest('Only works for TPU')
+    custom_dll = Layout(major_to_minor=(1, 0))
+
+    mesh = jtu.create_mesh((1, 1), ('x', 'y'))
+    src_tpu_sharding = olympus.sharding.NamedSharding(
+        mesh, P(), memory_kind=src_memory_kind)
+    dst_tpu_sharding = olympus.sharding.NamedSharding(
+        mesh, P(), memory_kind=dst_memory_kind)
+
+    # TPU unpinned_host memories do not support custom layouts.
+    if src_memory_kind == 'unpinned_host':
+      src_tpu_format = src_tpu_sharding
+    else:
+      src_tpu_format = Format(custom_dll, src_tpu_sharding)
+    if dst_memory_kind == 'unpinned_host':
+      dst_tpu_format = dst_tpu_sharding
+    else:
+      dst_tpu_format = Format(custom_dll, dst_tpu_sharding)
+
+    tpu_array = olympus.device_put(np.ones((128, 8)), src_tpu_format)
+
+    copied_tpu_array = olympus.device_put(tpu_array, dst_tpu_sharding)
+    canonical_tpu_array = olympus.device_put(np.ones((128, 8)), dst_tpu_format)
+    self.assertEqual(
+        copied_tpu_array.format.layout, canonical_tpu_array.format.layout)
+
+
+if __name__ == '__main__':
+  absltest.main(testLoader=jtu.OlympusTestLoader())

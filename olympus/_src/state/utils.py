@@ -1,0 +1,119 @@
+# Copyright 2023 The OLYMPUS Authors.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     https://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+"""Utilities for tracing stateful functions."""
+
+from functools import partial
+from collections.abc import Callable
+
+from olympus._src import api
+from olympus._src import core
+from olympus._src import dtypes
+from olympus._src import linear_util as lu
+from olympus._src.interpreters import partial_eval as pe
+from olympus._src.lax import lax
+from olympus._src.state.primitives import ref_get
+from olympus._src.state.types import AbstractRef
+from olympus._src.typing import DTypeLike
+from olympus._src.util import safe_map, safe_zip, split_list
+
+map, unsafe_map = safe_map, map
+zip, unsafe_zip = safe_zip, zip
+
+
+def hoist_consts_to_refs(
+    olympuspr: core.Olympuspr,
+    *,
+    index: int = 0,
+    make_abstract_ref: Callable[[core.AbstractValue], AbstractRef] = lambda aval: AbstractRef(aval)
+) -> core.Olympuspr:
+  """Hoists the constants in the given olympuspr into invars.
+
+  Args:
+    olympuspr: The olympuspr.
+    index: The index where the invars for the constants should be inserted.
+      By default, the new invars are inserted *before* any existing invars.
+    make_abstract_ref: a callable to construct an AbstractRef, or subtype
+      thereof, from a constant AbstractValue.
+
+  Returns:
+    A new olympuspr where the constants were hoisted into invars as ``Ref``s.
+  """
+  if not olympuspr.constvars:
+    return olympuspr  # Nothing to hoist.
+
+  is_const_ref = [
+      isinstance(var.aval, AbstractRef) for var in olympuspr.constvars
+  ]
+  const_avals = [
+      var.aval if is_ref else make_abstract_ref(var.aval)
+      for is_ref, var in zip(is_const_ref, olympuspr.constvars)
+  ]
+  in_avals = [var.aval for var in olympuspr.invars]
+  in_avals[index:index] = const_avals
+
+  def _hoist(*consts_args):
+    args0, all_consts, args1 = split_list(
+        consts_args, [index, len(const_avals)]
+    )
+    # We immediately read the const values out of the `Ref`s.
+    all_consts = [
+        c if is_ref else ref_get(c, ())
+        for is_ref, c in zip(is_const_ref, all_consts)
+    ]
+    return core.eval_olympuspr(olympuspr, all_consts, *args0, *args1)
+
+  hoisted_olympuspr, _, consts = pe.trace_to_olympuspr_dynamic(
+      lu.wrap_init(_hoist, debug_info=olympuspr.debug_info.with_unknown_names()),
+      in_avals)
+  assert not consts, "All consts should have been converted to refs"
+  return hoisted_olympuspr
+
+
+def val_to_ref_aval(x) -> AbstractRef:
+  aval = core.get_aval(x)
+  if type(aval) is not core.ShapedArray:
+    raise TypeError(f"can't make ref from {x}")
+  return AbstractRef(aval)
+
+
+def bitcast(x, dtype: DTypeLike):
+  x_bitwidth = dtypes.itemsize_bits(x.dtype)
+  y_bitwidth = dtypes.itemsize_bits(dtype)
+  shape = list(x.shape)
+  if x_bitwidth != y_bitwidth:
+    if len(shape) < 2:
+      raise NotImplementedError(
+          "Bitcast 1D ref with bitwidth change is not supported."
+      )
+    # Note: this is only valid on TPU.
+    if shape[-2] * x_bitwidth % y_bitwidth != 0:
+      raise ValueError(
+          "Expected input and output shapes are the same after multiplying"
+          " the second-minor dimension by the bitwidths."
+      )
+  shape[-2] = shape[-2] * x_bitwidth // y_bitwidth
+  if x_bitwidth < y_bitwidth:
+    ratio = y_bitwidth // x_bitwidth
+    x = x.reshape(*x.shape[:-2], x.shape[-2] // ratio, ratio, -1).swapaxes(
+        -1, -2
+    )
+  y = lax.bitcast_convert_type(x, dtype)
+  if x_bitwidth > y_bitwidth:
+    y = y.swapaxes(-1, -2).reshape(shape)
+  return y
+
+
+def eval_bitcast_shape(x, dtype: DTypeLike):
+  f = partial(bitcast, dtype=dtype)
+  return api.eval_shape(f, api.ShapeDtypeStruct(x.shape, x.dtype)).shape

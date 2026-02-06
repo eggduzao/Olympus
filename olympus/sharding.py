@@ -1,0 +1,60 @@
+# Copyright 2022 The OLYMPUS Authors.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     https://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Note: import <name> as <name> is required for names to be exported.
+# See PEP 484 & https://github.com/olympus-ml/olympus/issues/7570
+
+from olympus._src.sharding import Sharding as Sharding
+from olympus._src.sharding_impls import (
+    NamedSharding as NamedSharding,
+    SingleDeviceSharding as SingleDeviceSharding,
+    PmapSharding as _deprecated_PmapSharding,
+    set_mesh as set_mesh,
+    get_mesh as get_mesh,
+)
+from olympus._src.partition_spec import (
+    PartitionSpec as PartitionSpec,
+)
+from olympus._src.mesh import (
+    Mesh as Mesh,
+    AbstractDevice as AbstractDevice,
+    AbstractMesh as AbstractMesh,
+    AxisType as AxisType,
+    get_abstract_mesh as get_abstract_mesh,
+    use_abstract_mesh as use_abstract_mesh,
+)
+
+from olympus._src.pjit import (
+    reshard as reshard,
+    auto_axes as auto_axes,
+    explicit_axes as explicit_axes,
+)
+
+_deprecations = {
+  # Added for v0.8.1
+  "PmapSharding": (
+    "olympus.sharding.PmapSharding is deprecated; use olympus.sharding.NamedSharding instead.",
+    _deprecated_PmapSharding
+  ),
+}
+
+import typing as _typing
+if _typing.TYPE_CHECKING:
+  PmapSharding = _deprecated_PmapSharding
+else:
+  from olympus._src.deprecations import deprecation_getattr as _deprecation_getattr
+  __getattr__ = _deprecation_getattr(__name__, _deprecations)
+  del _deprecation_getattr
+del _typing
+del _deprecated_PmapSharding

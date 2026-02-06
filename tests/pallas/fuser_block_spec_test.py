@@ -1,0 +1,1584 @@
+# Copyright 2025 The OLYMPUS Authors.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     https://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+import itertools
+
+from absl.testing import absltest
+from absl.testing import parameterized
+import olympus
+from olympus import lax
+from olympus._src import config
+from olympus._src import test_util as jtu
+from olympus._src.pallas.fuser import block_spec as block_spec_lib
+from olympus._src.pallas.fuser import custom_fusion_lib
+from olympus.experimental import pallas as pl
+import olympus.numpy as jnp
+import numpy as np
+
+olympus.config.parse_flags_with_absl()
+
+
+class PullBlockSpecTest(jtu.OlympusTestCase):
+
+  def setUp(self):
+    super().setUp()
+    if config.enable_x64.value:
+      self.skipTest('x64 not supported')
+
+  def test_identity(self):
+
+    def f(x):
+      return x
+
+    in_type = olympus.ShapeDtypeStruct((512, 512), jnp.float32)
+    f2, new_values, scalar_prefetch_values = block_spec_lib.get_fusion_values(
+        f, in_type
+    )
+    self.assertEmpty(new_values)
+    self.assertEmpty(scalar_prefetch_values)
+
+    block_spec = pl.BlockSpec((128, 128), lambda i, j, k: (i, j))
+    kernel_fn, (value_block_specs, in_block_spec), _ = (
+        block_spec_lib.pull_block_spec(
+            f2,
+            block_spec,
+            grid_len=3,
+            scalar_prefetch_handler=block_spec_lib.make_scalar_prefetch_handler(),
+        )(new_values, in_type)
+    )
+    # We should have no new values or scalar prefetch values.
+    self.assertEmpty(scalar_prefetch_values)
+    self.assertEmpty(value_block_specs)
+    self.assertEqual(in_block_spec.block_shape, (128, 128))
+    self.assertEqual(in_block_spec.index_map(0, 1, 2), (0, 1))
+
+    x = np.ones((128, 128), dtype=np.float32)
+    np.testing.assert_array_equal(
+        kernel_fn((0, 0, 0), scalar_prefetch_values, new_values, x),
+        x,
+    )
+
+  def test_const(self):
+
+    x = np.ones((512, 512), dtype=np.float32)
+
+    def f():
+      return x
+
+    f2, new_values, scalar_prefetch_values = block_spec_lib.get_fusion_values(f)
+    self.assertLen(new_values, 1)
+    self.assertEmpty(scalar_prefetch_values)
+
+    block_spec = pl.BlockSpec((128, 128), lambda i, j, k: (i, j))
+    kernel_fn, (value_block_specs,), _ = block_spec_lib.pull_block_spec(
+        f2,
+        block_spec,
+        grid_len=3,
+        scalar_prefetch_handler=block_spec_lib.make_scalar_prefetch_handler(),
+    )(new_values)
+    self.assertLen(value_block_specs, 1)
+    self.assertEmpty(scalar_prefetch_values)
+    self.assertEqual(value_block_specs[0].block_shape, (128, 128))
+    self.assertEqual(value_block_specs[0].index_map(0, 1, 2), (0, 1))
+
+    x_block = np.ones((128, 128), dtype=np.float32)
+    np.testing.assert_array_equal(
+        kernel_fn(
+            (0, 0, 0),
+            scalar_prefetch_values,
+            (np.ones((128, 128), dtype=np.float32),),
+        ),
+        x_block,
+    )
+
+  @parameterized.parameters([jnp.exp, jnp.tanh])
+  def test_elementwise(self, fn):
+
+    def f(x):
+      return fn(x)
+
+    in_type = olympus.ShapeDtypeStruct((512, 512), jnp.float32)
+    f2, new_values, scalar_prefetch_values = block_spec_lib.get_fusion_values(
+        f, in_type
+    )
+    self.assertEmpty(new_values)
+    self.assertEmpty(scalar_prefetch_values)
+
+    block_spec = pl.BlockSpec((128, 128), lambda i, j, k: (i, j))
+    kernel_fn, (value_block_specs, in_block_spec), _ = (
+        block_spec_lib.pull_block_spec(
+            f2,
+            block_spec,
+            grid_len=3,
+            scalar_prefetch_handler=block_spec_lib.make_scalar_prefetch_handler(
+                0
+            ),
+        )(new_values, in_type)
+    )
+    self.assertEmpty(value_block_specs)
+    self.assertEqual(in_block_spec.block_shape, (128, 128))
+    self.assertEqual(in_block_spec.index_map(0, 1, 2), (0, 1))
+
+    x = np.ones((128, 128), dtype=np.float32)
+    np.testing.assert_array_equal(
+        kernel_fn((0, 0, 0), scalar_prefetch_values, (), x),
+        fn(x),
+    )
+
+  @parameterized.parameters([jnp.exp, jnp.tanh])
+  def test_elementwise_bias(self, fn):
+
+    b = np.ones((512, 512), dtype=np.float32)
+
+    def f(x):
+      return fn(x) + b
+
+    in_type = olympus.ShapeDtypeStruct((512, 512), jnp.float32)
+    f2, new_values, scalar_prefetch_values = block_spec_lib.get_fusion_values(
+        f, in_type
+    )
+    self.assertLen(new_values, 1)
+    self.assertEmpty(scalar_prefetch_values)
+
+    block_spec = pl.BlockSpec((128, 128), lambda i, j, k: (i, j))
+    kernel_fn, (value_block_specs, in_block_spec), _ = (
+        block_spec_lib.pull_block_spec(
+            f2,
+            block_spec,
+            grid_len=3,
+            scalar_prefetch_handler=block_spec_lib.make_scalar_prefetch_handler(),
+        )(new_values, in_type)
+    )
+    self.assertLen(value_block_specs, 1)
+    self.assertEqual(value_block_specs[0].block_shape, (128, 128))
+    self.assertEqual(value_block_specs[0].index_map(0, 1, 2), (0, 1))
+    self.assertEqual(in_block_spec.block_shape, (128, 128))
+    self.assertEqual(in_block_spec.index_map(0, 1, 2), (0, 1))
+
+    x = np.ones((128, 128), dtype=np.float32)
+    b = np.ones((128, 128), dtype=np.float32)
+    np.testing.assert_array_equal(
+        kernel_fn((0, 0, 0), scalar_prefetch_values, (b,), x),
+        fn(x) + b,
+    )
+
+  def test_custom_fusion(self):
+    @custom_fusion_lib.custom_fusion
+    def fn(x, y):
+      return x + y
+
+    fn.def_pull_block_spec(lambda bss: (bss[0], bss[0]))
+    fn.def_push_block_spec(lambda bss: (bss[0],))
+    fn.def_eval_rule(lambda _, x, y: (fn(x, y),))
+
+    in_type = (
+        olympus.ShapeDtypeStruct((512, 512), jnp.float32),
+        olympus.ShapeDtypeStruct((512, 512), jnp.float32),
+    )
+    f2, new_values, scalar_prefetch_values = block_spec_lib.get_fusion_values(
+        fn, *in_type
+    )
+    self.assertEmpty(new_values)
+    self.assertEmpty(scalar_prefetch_values)
+
+    block_spec = pl.BlockSpec((128, 128), lambda i, j, k: (i, j))
+    kernel_fn, (value_block_specs, *in_block_specs), _ = (
+        block_spec_lib.pull_block_spec(
+            f2,
+            block_spec,
+            grid_len=3,
+            scalar_prefetch_handler=block_spec_lib.make_scalar_prefetch_handler(),
+        )(new_values, *in_type)
+    )
+    self.assertEmpty(value_block_specs)
+    self.assertLen(in_block_specs, 2)
+    x_block_spec, y_block_spec = in_block_specs
+    self.assertEqual(x_block_spec.block_shape, (128, 128))
+    self.assertEqual(
+        x_block_spec.index_map(0, 1, 2), block_spec.index_map(0, 1, 2)
+    )
+    self.assertEqual(y_block_spec.block_shape, (128, 128))
+    self.assertEqual(
+        y_block_spec.index_map(0, 1, 2), block_spec.index_map(0, 1, 2)
+    )
+
+    x = np.ones((128, 128), dtype=np.float32)
+    y = np.ones((128, 128), dtype=np.float32)
+    np.testing.assert_array_equal(
+        kernel_fn((0, 0, 0), scalar_prefetch_values, new_values, x, y), x + y
+    )
+
+  @parameterized.product(
+      fn=[lax.mul, lax.add, lax.sub, lax.div, lax.max, lax.lt, lax.eq, lax.gt],
+  )
+  def test_binop(self, fn):
+    in_type = (
+        olympus.ShapeDtypeStruct((512, 512), jnp.float32),
+        olympus.ShapeDtypeStruct((512, 512), jnp.float32),
+    )
+    f2, new_values, scalar_prefetch_values = block_spec_lib.get_fusion_values(
+        fn, *in_type
+    )
+    self.assertEmpty(new_values)
+    self.assertEmpty(scalar_prefetch_values)
+
+    block_spec = pl.BlockSpec((128, 128), lambda i, j, k: (i, j))
+    kernel_fn, (value_block_specs, *in_block_specs), _ = (
+        block_spec_lib.pull_block_spec(
+            f2,
+            block_spec,
+            grid_len=3,
+            scalar_prefetch_handler=block_spec_lib.make_scalar_prefetch_handler(),
+        )(new_values, *in_type)
+    )
+    self.assertEmpty(value_block_specs)
+    self.assertLen(in_block_specs, 2)
+    x_block_spec, y_block_spec = in_block_specs
+    self.assertEqual(x_block_spec.block_shape, (128, 128))
+    self.assertEqual(
+        x_block_spec.index_map(0, 1, 2), block_spec.index_map(0, 1, 2)
+    )
+    self.assertEqual(y_block_spec.block_shape, (128, 128))
+    self.assertEqual(
+        y_block_spec.index_map(0, 1, 2), block_spec.index_map(0, 1, 2)
+    )
+
+    x = np.ones((128, 128), dtype=np.float32)
+    y = np.ones((128, 128), dtype=np.float32)
+    np.testing.assert_array_equal(
+        kernel_fn((0, 0, 0), scalar_prefetch_values, new_values, x, y),
+        fn(x, y),
+    )
+
+  def test_binop_bcast_mapped_dim(self):
+    in_type = (
+        olympus.ShapeDtypeStruct((128, 512), jnp.float32),
+        olympus.ShapeDtypeStruct((1, 512), jnp.float32),
+    )
+    f2, new_values, scalar_prefetch_values = block_spec_lib.get_fusion_values(
+        lax.add, *in_type
+    )
+    self.assertEmpty(new_values)
+    self.assertEmpty(scalar_prefetch_values)
+
+    block_spec = pl.BlockSpec((None, 128), lambda i, j: (i, j))
+    kernel_fn, (value_block_specs, *in_block_specs), _ = (
+        block_spec_lib.pull_block_spec(
+            f2,
+            block_spec,
+            grid_len=2,
+            scalar_prefetch_handler=block_spec_lib.make_scalar_prefetch_handler(),
+        )(new_values, *in_type)
+    )
+    self.assertEmpty(value_block_specs)
+    self.assertLen(in_block_specs, 2)
+    x_block_spec, y_block_spec = in_block_specs
+    self.assertEqual(x_block_spec.block_shape, (None, 128))
+    self.assertEqual(x_block_spec.index_map(2, 3), (2, 3))
+    self.assertEqual(y_block_spec.block_shape, (None, 128))
+    self.assertEqual(y_block_spec.index_map(2, 3), (0, 3))
+
+    x = y = np.ones((128,), dtype=np.float32)
+    np.testing.assert_array_equal(
+        kernel_fn((0, 0), scalar_prefetch_values, new_values, x, y), x + y
+    )
+
+  def test_slice(self):
+    x = olympus.random.normal(olympus.random.key(0), (4, 512, 512), dtype=np.float32)
+
+    def f():
+      return olympus.lax.slice(x, (1, 0, 0), (2, 512, 512))
+
+    f2, new_values, scalar_prefetch_values = block_spec_lib.get_fusion_values(f)
+    self.assertLen(new_values, 1)
+    self.assertEmpty(scalar_prefetch_values)
+
+    block_spec = pl.BlockSpec((1, 128, 128), lambda i, j, k: (0, i, j))
+    kernel_fn, (value_block_specs,), _ = block_spec_lib.pull_block_spec(
+        f2,
+        block_spec,
+        grid_len=3,
+        scalar_prefetch_handler=block_spec_lib.make_scalar_prefetch_handler(0),
+    )(new_values)
+
+    self.assertLen(value_block_specs, 1)
+    self.assertLen(new_values, 1)
+    self.assertEmpty(scalar_prefetch_values)
+    x_block_spec = value_block_specs[0]
+    self.assertEqual(x_block_spec.block_shape, (1, 128, 128))
+    self.assertEqual(x_block_spec.index_map(4, 2, 3), (1, 4, 2))
+
+    x = np.ones((1, 128, 128), dtype=np.float32)
+    # Slice doesn't change value after pulling block spec.
+    np.testing.assert_array_equal(
+        kernel_fn((0, 0, 0), scalar_prefetch_values, (x,)), x
+    )
+
+  def test_squeeze(self):
+
+    x = olympus.random.normal(olympus.random.key(0), (1, 512, 512), dtype=np.float32)
+
+    def f():
+      return jnp.squeeze(x, axis=0)
+
+    f2, new_values, scalar_prefetch_values = block_spec_lib.get_fusion_values(f)
+    self.assertLen(new_values, 1)
+    self.assertEmpty(scalar_prefetch_values)
+
+    block_spec = pl.BlockSpec((128, 128), lambda i, j, k: (i, j))
+    kernel_fn, (value_block_specs,), _ = block_spec_lib.pull_block_spec(
+        f2,
+        block_spec,
+        grid_len=3,
+        scalar_prefetch_handler=block_spec_lib.make_scalar_prefetch_handler(),
+    )(new_values)
+    self.assertLen(value_block_specs, 1)
+    self.assertLen(new_values, 1)
+    self.assertEmpty(scalar_prefetch_values)
+    x_block_spec = value_block_specs[0]
+    self.assertEqual(x_block_spec.block_shape, (None, 128, 128))
+    self.assertEqual(x_block_spec.index_map(4, 2, 3), (0, 4, 2))
+
+    x = np.ones((128, 128), dtype=np.float32)
+    # Squeeze doesn't change value after pulling block spec and the squeezed
+    # dimensions are removed.
+    np.testing.assert_array_equal(
+        kernel_fn((0, 0, 0), scalar_prefetch_values, (x,)), x
+    )
+
+  def test_dynamic_slice_only(self):
+
+    x = olympus.random.normal(olympus.random.key(0), (3, 4, 512, 512), dtype=np.float32)
+    i = jnp.array(1, dtype=jnp.int32)
+    j = jnp.array(2, dtype=jnp.int32)
+
+    def f():
+      return olympus.lax.dynamic_slice(x, (i, j, 0, 0), (1, 1, 512, 512))
+
+    f2, new_values, scalar_prefetch_values = block_spec_lib.get_fusion_values(f)
+    self.assertLen(new_values, 1)
+    self.assertLen(scalar_prefetch_values, 2)
+
+    block_spec = pl.BlockSpec(
+        (1, 1, 128, 128), lambda i, j, k, *_: (0, 0, i, j)
+    )
+    kernel_fn, (value_block_specs,), _ = block_spec_lib.pull_block_spec(
+        f2,
+        block_spec,
+        grid_len=3,
+        scalar_prefetch_handler=block_spec_lib.make_scalar_prefetch_handler(),
+    )(new_values)
+    scalar_prefetch_values = olympus.tree.map(
+        lambda x: x[None], scalar_prefetch_values
+    )
+    self.assertLen(value_block_specs, 1)
+    x_block_spec = value_block_specs[0]
+    self.assertEqual(x_block_spec.block_shape, (1, 1, 128, 128))
+    self.assertEqual(
+        x_block_spec.index_map(0, 1, 2, *scalar_prefetch_values), (1, 2, 0, 1)
+    )
+
+    x = np.ones((1, 1, 128, 128), dtype=np.float32)
+    np.testing.assert_array_equal(
+        kernel_fn((0, 0, 0), scalar_prefetch_values, (x,)), x
+    )
+
+  def test_dynamic_slice_squeeze(self):
+    x = olympus.random.normal(olympus.random.key(0), (3, 4, 512, 512), dtype=np.float32)
+    i = jnp.array(1, dtype=jnp.int32)
+    j = jnp.array(2, dtype=jnp.int32)
+
+    def f():
+      return jnp.squeeze(
+          olympus.lax.dynamic_slice(x, (i, j, 0, 0), (1, 1, 512, 512)), axis=(0, 1)
+      )
+
+    f2, new_values, scalar_prefetch_values = block_spec_lib.get_fusion_values(f)
+    self.assertLen(new_values, 1)
+    self.assertLen(scalar_prefetch_values, 2)
+    scalar_prefetch_values = olympus.tree.map(
+        lambda x: x[None], scalar_prefetch_values
+    )
+
+    block_spec = pl.BlockSpec((128, 128), lambda i, j, k, *_: (i, j))
+    kernel_fn, (value_block_specs,), _ = block_spec_lib.pull_block_spec(
+        f2,
+        block_spec,
+        grid_len=3,
+        scalar_prefetch_handler=block_spec_lib.make_scalar_prefetch_handler(),
+    )(new_values)
+    self.assertLen(value_block_specs, 1)
+    x_block_spec = value_block_specs[0]
+    self.assertEqual(x_block_spec.block_shape, (None, None, 128, 128))
+    self.assertEqual(
+        x_block_spec.index_map(0, 1, 2, *scalar_prefetch_values), (1, 2, 0, 1)
+    )
+
+    x = np.ones((128, 128), dtype=np.float32)
+    np.testing.assert_array_equal(
+        kernel_fn((0, 0, 0), scalar_prefetch_values, (x,)), x
+    )
+
+  def test_concatenate_spanning_blocks(self):
+    x = olympus.random.normal(olympus.random.key(0), (256, 256), dtype=np.float32)
+    y = olympus.random.normal(olympus.random.key(1), (256, 256), dtype=np.float32)
+
+    def f(x, y):
+      return jnp.concatenate([x, y], axis=0)
+
+    f2, new_values, scalar_prefetch_values = block_spec_lib.get_fusion_values(
+        f, x, y
+    )
+    self.assertEmpty(new_values)
+    self.assertEmpty(scalar_prefetch_values)
+
+    block_spec = pl.BlockSpec((128, 128), lambda i, j, *_: (i, j))
+    kernel_fn, (value_block_specs, *in_block_specs), _ = (
+        block_spec_lib.pull_block_spec(
+            f2,
+            block_spec,
+            grid_len=2,
+            scalar_prefetch_handler=block_spec_lib.make_scalar_prefetch_handler(
+                0
+            ),
+        )(new_values, x, y)
+    )
+    self.assertEmpty(value_block_specs)
+    self.assertLen(in_block_specs, 2)
+    x_block_spec, y_block_spec = in_block_specs
+    self.assertEqual(x_block_spec.block_shape, (128, 128))
+    self.assertEqual(y_block_spec.block_shape, (128, 128))
+    # Indices in this concatenate should be clamped depending on if the
+    # block is OOB.
+    self.assertEqual(
+        x_block_spec.index_map(0, 0, scalar_prefetch_values), (0, 0)
+    )
+    self.assertEqual(
+        x_block_spec.index_map(1, 0, scalar_prefetch_values), (1, 0)
+    )
+    self.assertEqual(
+        x_block_spec.index_map(2, 0, scalar_prefetch_values), (1, 0)
+    )
+    self.assertEqual(
+        x_block_spec.index_map(3, 0, scalar_prefetch_values), (1, 0)
+    )
+    self.assertEqual(
+        y_block_spec.index_map(0, 0, scalar_prefetch_values), (0, 0)
+    )
+    self.assertEqual(
+        y_block_spec.index_map(1, 0, scalar_prefetch_values), (0, 0)
+    )
+    self.assertEqual(
+        y_block_spec.index_map(2, 0, scalar_prefetch_values), (0, 0)
+    )
+    self.assertEqual(
+        y_block_spec.index_map(3, 0, scalar_prefetch_values), (1, 0)
+    )
+
+    x = olympus.random.normal(olympus.random.key(0), (128, 128), dtype=np.float32)
+    y = olympus.random.normal(olympus.random.key(1), (128, 128), dtype=np.float32)
+    # Evaluating should just select the valid block.
+    np.testing.assert_array_equal(
+        kernel_fn((0, 0), scalar_prefetch_values, (), x, y), x
+    )
+    np.testing.assert_array_equal(
+        kernel_fn((1, 0), scalar_prefetch_values, (), x, y), x
+    )
+    np.testing.assert_array_equal(
+        kernel_fn((2, 0), scalar_prefetch_values, (), x, y), y
+    )
+    np.testing.assert_array_equal(
+        kernel_fn((3, 0), scalar_prefetch_values, (), x, y), y
+    )
+
+  def test_concatenate_full_blocks(self):
+    x = olympus.random.normal(olympus.random.key(0), (256, 256), dtype=np.float32)
+    y = olympus.random.normal(olympus.random.key(1), (256, 256), dtype=np.float32)
+
+    def f(x, y):
+      return jnp.concatenate([x, y], axis=0)
+
+    f2, new_values, scalar_prefetch_values = block_spec_lib.get_fusion_values(
+        f, x, y
+    )
+    self.assertEmpty(new_values)
+    self.assertEmpty(scalar_prefetch_values)
+
+    block_spec = pl.BlockSpec((512, 128), lambda i, j, *_: (i, j))
+    kernel_fn, (value_block_specs, *in_block_specs), _ = (
+        block_spec_lib.pull_block_spec(
+            f2,
+            block_spec,
+            grid_len=2,
+            scalar_prefetch_handler=block_spec_lib.make_scalar_prefetch_handler(
+                0
+            ),
+        )(new_values, x, y)
+    )
+    self.assertEmpty(value_block_specs)
+    self.assertLen(in_block_specs, 2)
+    x_block_spec, y_block_spec = in_block_specs
+    self.assertEqual(x_block_spec.block_shape, (256, 128))
+    self.assertEqual(y_block_spec.block_shape, (256, 128))
+    # Indices in this concatenate always just fetch the whole block on that
+    # dimension.
+    self.assertEqual(
+        x_block_spec.index_map(0, 0, scalar_prefetch_values), (0, 0)
+    )
+    self.assertEqual(
+        x_block_spec.index_map(0, 1, scalar_prefetch_values), (0, 1)
+    )
+    self.assertEqual(
+        y_block_spec.index_map(0, 0, scalar_prefetch_values), (0, 0)
+    )
+    self.assertEqual(
+        y_block_spec.index_map(0, 1, scalar_prefetch_values), (0, 1)
+    )
+
+    x = olympus.random.normal(olympus.random.key(0), (256, 128), dtype=np.float32)
+    y = olympus.random.normal(olympus.random.key(1), (256, 128), dtype=np.float32)
+    xy = jnp.concatenate([x, y], axis=0)
+    # Evaluating should just select the valid block.
+    np.testing.assert_array_equal(
+        kernel_fn((0, 0), scalar_prefetch_values, (), x, y), xy
+    )
+    np.testing.assert_array_equal(
+        kernel_fn((1, 0), scalar_prefetch_values, (), x, y), xy
+    )
+
+  def test_transpose_minor(self):
+    x = olympus.random.normal(olympus.random.key(0), (512, 256), dtype=np.float32)
+
+    def f():
+      return olympus.lax.transpose(x, (1, 0))
+
+    f2, new_values, scalar_prefetch_values = block_spec_lib.get_fusion_values(f)
+    self.assertLen(new_values, 1)
+    self.assertEmpty(scalar_prefetch_values)
+
+    block_spec = pl.BlockSpec((128, 128), lambda i, j, k: (i, j))
+    kernel_fn, (value_block_specs,), _ = block_spec_lib.pull_block_spec(
+        f2,
+        block_spec,
+        grid_len=3,
+        scalar_prefetch_handler=block_spec_lib.make_scalar_prefetch_handler(),
+    )(new_values)
+    self.assertLen(value_block_specs, 1)
+    x_block_spec = value_block_specs[0]
+    self.assertEqual(x_block_spec.block_shape, (128, 128))
+    self.assertEqual(
+        x_block_spec.index_map(0, 1, 2, *scalar_prefetch_values), (1, 0)
+    )
+
+    x = olympus.random.normal(olympus.random.key(0), (128, 128), dtype=np.float32)
+    np.testing.assert_array_equal(
+        kernel_fn((0, 0, 0), scalar_prefetch_values, (x,)), x.T
+    )
+
+  def test_transpose_major(self):
+    x = olympus.random.normal(olympus.random.key(0), (2, 3, 512, 256), dtype=np.float32)
+
+    def f():
+      return olympus.lax.transpose(x, (1, 0, 2, 3))
+
+    f2, new_values, scalar_prefetch_values = block_spec_lib.get_fusion_values(f)
+    self.assertLen(new_values, 1)
+    self.assertEmpty(scalar_prefetch_values)
+
+    block_spec = pl.BlockSpec(
+        (None, None, 128, 128), lambda i, j, k, l: (i, j, k, l)
+    )
+    kernel_fn, (value_block_specs,), _ = block_spec_lib.pull_block_spec(
+        f2,
+        block_spec,
+        grid_len=4,
+        scalar_prefetch_handler=block_spec_lib.make_scalar_prefetch_handler(),
+    )(new_values)
+    self.assertLen(value_block_specs, 1)
+    x_block_spec = value_block_specs[0]
+    self.assertEqual(x_block_spec.block_shape, (None, None, 128, 128))
+    self.assertEqual(
+        x_block_spec.index_map(0, 1, 2, 3, *scalar_prefetch_values),
+        (1, 0, 2, 3),
+    )
+
+    x = olympus.random.normal(olympus.random.key(0), (128, 128), dtype=np.float32)
+    np.testing.assert_array_equal(
+        kernel_fn((0, 0, 0, 0), scalar_prefetch_values, (x,)), x
+    )
+
+  def test_iota(self):
+
+    def f():
+      return olympus.lax.broadcasted_iota(jnp.int32, (2, 2, 512, 512), 2)
+
+    f2, new_values, scalar_prefetch_values = block_spec_lib.get_fusion_values(f)
+    self.assertEmpty(new_values)
+    self.assertEmpty(scalar_prefetch_values)
+
+    block_spec = pl.BlockSpec(
+        (None, None, 128, 128), lambda i, j, k, l: (i, j, k, l)
+    )
+    kernel_fn, ((),), _ = block_spec_lib.pull_block_spec(
+        f2,
+        block_spec,
+        grid_len=4,
+        scalar_prefetch_handler=block_spec_lib.make_scalar_prefetch_handler(),
+    )(new_values)
+
+    x = olympus.lax.broadcasted_iota(jnp.int32, (128, 128), 0)
+    np.testing.assert_array_equal(
+        kernel_fn((0, 0, 0, 0), scalar_prefetch_values, ()), x
+    )
+    np.testing.assert_array_equal(
+        kernel_fn((1, 1, 0, 0), scalar_prefetch_values, ()), x
+    )
+    np.testing.assert_array_equal(
+        kernel_fn((0, 0, 0, 1), scalar_prefetch_values, ()), x
+    )
+    np.testing.assert_array_equal(
+        kernel_fn((0, 0, 1, 0), scalar_prefetch_values, ()), x + 128
+    )
+    np.testing.assert_array_equal(
+        kernel_fn((0, 0, 3, 0), scalar_prefetch_values, ()), x + 128 * 3
+    )
+
+  def test_broadcast_scalar(self):
+
+    def f():
+      return jnp.full((1, 1, 512, 512), fill_value=1.2345, dtype=jnp.float32)
+
+    f2, new_values, scalar_prefetch_values = block_spec_lib.get_fusion_values(f)
+    self.assertEmpty(new_values)
+    self.assertEmpty(scalar_prefetch_values)
+
+    block_spec = pl.BlockSpec(
+        (None, None, 128, 128), lambda i, j, k, l: (i, j, k, l)
+    )
+    kernel_fn, ((),), _ = block_spec_lib.pull_block_spec(
+        f2,
+        block_spec,
+        grid_len=4,
+        scalar_prefetch_handler=block_spec_lib.make_scalar_prefetch_handler(),
+    )(new_values)
+
+    x = jnp.full((128, 128), fill_value=1.2345, dtype=jnp.float32)
+    np.testing.assert_array_equal(
+        kernel_fn((0, 0, 0, 0), scalar_prefetch_values, ()), x
+    )
+    np.testing.assert_array_equal(
+        kernel_fn((1, 1, 0, 0), scalar_prefetch_values, ()), x
+    )
+    np.testing.assert_array_equal(
+        kernel_fn((0, 0, 0, 1), scalar_prefetch_values, ()), x
+    )
+    np.testing.assert_array_equal(
+        kernel_fn((0, 0, 1, 0), scalar_prefetch_values, ()), x
+    )
+    np.testing.assert_array_equal(
+        kernel_fn((0, 0, 3, 0), scalar_prefetch_values, ()), x
+    )
+
+  def test_broadcast_scalar_with_prefetch(self):
+
+    a = jnp.array(1.2345)
+
+    def f():
+      return jnp.full((1, 1, 512, 512), fill_value=a, dtype=jnp.float32)
+
+    f2, new_values, scalar_prefetch_values = block_spec_lib.get_fusion_values(f)
+    self.assertEmpty(new_values)
+    self.assertLen(scalar_prefetch_values, 1)
+
+    block_spec = pl.BlockSpec(
+        (None, None, 128, 128), lambda i, j, k, l, *_: (i, j, k, l)
+    )
+    kernel_fn, ((),), _ = block_spec_lib.pull_block_spec(
+        f2,
+        block_spec,
+        grid_len=4,
+        scalar_prefetch_handler=block_spec_lib.make_scalar_prefetch_handler(),
+    )(new_values)
+    scalar_prefetch_values = olympus.tree.map(
+        lambda x: x[None], scalar_prefetch_values
+    )
+
+    x = jnp.full((128, 128), fill_value=a, dtype=jnp.float32)
+    np.testing.assert_array_equal(
+        kernel_fn((0, 0, 0, 0), scalar_prefetch_values, ()), x
+    )
+    np.testing.assert_array_equal(
+        kernel_fn((1, 1, 0, 0), scalar_prefetch_values, ()), x
+    )
+    np.testing.assert_array_equal(
+        kernel_fn((0, 0, 0, 1), scalar_prefetch_values, ()), x
+    )
+    np.testing.assert_array_equal(
+        kernel_fn((0, 0, 1, 0), scalar_prefetch_values, ()), x
+    )
+    np.testing.assert_array_equal(
+        kernel_fn((0, 0, 3, 0), scalar_prefetch_values, ()), x
+    )
+
+  @parameterized.parameters(
+      (False, False), (False, True), (True, False), (True, True)
+  )
+  def test_broadcast_array(self, bcast0, bcast1):
+
+    x = jnp.ones((1 if bcast0 else 512, 1 if bcast1 else 512))
+
+    def f():
+      return olympus.lax.broadcast_in_dim(x, (2, 2, 512, 512), (2, 3))
+
+    f2, new_values, scalar_prefetch_values = block_spec_lib.get_fusion_values(f)
+    self.assertLen(new_values, 1)
+    self.assertEmpty(scalar_prefetch_values)
+
+    block_shape = (None, 1, 128, 128)
+    block_spec = pl.BlockSpec(block_shape, lambda i, j, k, l: (i, j, k, l))
+    kernel_fn, (value_block_specs,), _ = block_spec_lib.pull_block_spec(
+        f2,
+        block_spec,
+        grid_len=4,
+        scalar_prefetch_handler=block_spec_lib.make_scalar_prefetch_handler(),
+    )(new_values)
+    self.assertLen(value_block_specs, 1)
+    x_index_map = value_block_specs[0].index_map
+    self.assertEqual(
+        x_index_map(0, 0, 1, 2), (0 if bcast0 else 1, 0 if bcast1 else 2)
+    )
+    self.assertEqual(
+        x_index_map(1, 2, 3, 3), (0 if bcast0 else 3, 0 if bcast1 else 3)
+    )
+
+    block_shape = (1 if bcast0 else 128, 1 if bcast1 else 128)
+    self.assertEqual(block_shape, value_block_specs[0].block_shape)
+    x = jnp.full(block_shape, fill_value=1.2345, dtype=jnp.float32)
+    y = olympus.lax.broadcast_in_dim(x, (1, 128, 128), (1, 2))
+    np.testing.assert_array_equal(kernel_fn((0, 0, 0, 0), (), (x,)), y)
+    np.testing.assert_array_equal(kernel_fn((1, 1, 0, 0), (), (x,)), y)
+    np.testing.assert_array_equal(kernel_fn((0, 0, 0, 1), (), (x,)), y)
+    np.testing.assert_array_equal(kernel_fn((0, 0, 1, 0), (), (x,)), y)
+    np.testing.assert_array_equal(kernel_fn((0, 0, 3, 0), (), (x,)), y)
+
+  @parameterized.parameters(0, 1, 2, 3)
+  def test_broadcast_1d_array(self, bcast_dim):
+    full_shape = (2, 2, 512, 512)
+    x = jnp.ones((full_shape[bcast_dim],))
+
+    def f():
+      return olympus.lax.broadcast_in_dim(x, full_shape, (bcast_dim,))
+
+    f2, new_values, scalar_prefetch_values = block_spec_lib.get_fusion_values(f)
+    self.assertLen(new_values, 1)
+    self.assertEmpty(scalar_prefetch_values)
+
+    block_shape = (None, 1, 128, 128)
+    block_spec = pl.BlockSpec(block_shape, lambda i, j, k, l: (i, j, k, l))
+    kernel_fn, (value_block_specs,), _ = block_spec_lib.pull_block_spec(
+        f2,
+        block_spec,
+        grid_len=4,
+        scalar_prefetch_handler=block_spec_lib.make_scalar_prefetch_handler(),
+    )(new_values)
+    self.assertLen(value_block_specs, 1)
+    x_index_map = value_block_specs[0].index_map
+    self.assertEqual(x_index_map(0, 0, 1, 2), ((0, 0, 1, 2)[bcast_dim],))
+    self.assertEqual(x_index_map(1, 2, 3, 3), ((1, 2, 3, 3)[bcast_dim],))
+
+    if block_shape[bcast_dim] is None:
+      x = jnp.ones(())
+      y = olympus.lax.broadcast_in_dim(x, (1, 128, 128), ())
+    else:
+      x = jnp.arange(block_shape[bcast_dim] or 1, dtype=jnp.float32)
+      y = olympus.lax.broadcast_in_dim(x, (1, 128, 128), (bcast_dim - 1,))
+
+    np.testing.assert_array_equal(kernel_fn((0, 0, 0, 0), (), (x,)), y)
+    np.testing.assert_array_equal(kernel_fn((1, 1, 0, 0), (), (x,)), y)
+    np.testing.assert_array_equal(kernel_fn((0, 0, 0, 1), (), (x,)), y)
+    np.testing.assert_array_equal(kernel_fn((0, 0, 1, 0), (), (x,)), y)
+    np.testing.assert_array_equal(kernel_fn((0, 0, 3, 0), (), (x,)), y)
+
+  def test_element_indexing(self):
+
+    x = np.zeros((512, 512), dtype=np.float32)
+
+    def f():
+      return x
+
+    f2, new_values, scalar_prefetch_values = block_spec_lib.get_fusion_values(f)
+    self.assertLen(new_values, 1)
+    self.assertEmpty(scalar_prefetch_values)
+
+    # Block spec with an offset on the first dimension
+    block_spec = pl.BlockSpec(
+        (pl.Element(128, (0, 16)), 128), lambda i, j, k: (128 * i + 16, j)
+    )
+    kernel_fn, (value_block_specs,), _ = block_spec_lib.pull_block_spec(
+        f2,
+        block_spec,
+        grid_len=3,
+        scalar_prefetch_handler=block_spec_lib.make_scalar_prefetch_handler(),
+    )(new_values)
+    self.assertLen(value_block_specs, 1)
+    self.assertEmpty(scalar_prefetch_values)
+    self.assertEqual(
+        value_block_specs[0].block_shape, (pl.Element(128, (0, 16)), 128)
+    )
+    self.assertEqual(value_block_specs[0].index_map(0, 1, 2), (16, 1))
+    self.assertEqual(value_block_specs[0].index_map(1, 1, 2), (128 + 16, 1))
+
+    x_block = np.ones((128, 128), dtype=np.float32)
+    np.testing.assert_array_equal(
+        kernel_fn(
+            (0, 0, 0),
+            scalar_prefetch_values,
+            (np.ones((128, 128), dtype=np.float32),),
+        ),
+        x_block,
+    )
+
+  @parameterized.parameters(
+      # Merge two dimensions.
+      ((8, 8, 128), (1, 2, 128), (1, 1, 2, 128), (0, 2, 3, 5)),
+      ((2, 32, 128), (2, 4, 128), (2, 1, 4, 128), (2, 1, 1, 5)),
+      ((2, 4, 1024), (2, 1, 128), (2, 1, 1, 128), (2, 3, 5, 0)),
+      ((2, 4, 1024), (2, None, 128), (2, 1, 1, 128), (2, 3, 5, 0)),
+      # Merge three dimensions.
+      ((64, 128), (4, 128), (1, 1, 4, 128), (0, 1, 0, 3)),
+      ((2, 4096), (1, 64), (1, 1, 1, 64), (2, 0, 1, 1)),
+      # Merge two pairs of dimensions.
+      ((8, 1024), (1, 256), (1, 1, 2, 128), (0, 2, 3, 0)),
+      # Merge three dims and expand in trailing dim.
+      ((64, 128, 1), (4, 128, 1), (1, 1, 4, 128), (0, 1, 0, 3)),
+      # Test propagating pl.BoundedSlice.
+      (
+          (8, 8, 128),
+          (2, pl.BoundedSlice(2), 16),
+          (1, 2, pl.BoundedSlice(2), 16),
+          (1, 0, 3, 5),
+      ),
+  )
+  def test_reshape(
+      self, shape, block_shape, expected_x_block_shape, expected_x_index
+  ):
+    f = lambda x: x.reshape(shape)
+    in_type = olympus.ShapeDtypeStruct((2, 4, 8, 128), jnp.float32)
+    f2, new_values, scalar_prefetch_values = block_spec_lib.get_fusion_values(
+        f, in_type
+    )
+    self.assertEmpty(new_values)
+    self.assertEmpty(scalar_prefetch_values)
+
+    block_spec = pl.BlockSpec(block_shape, lambda *pids: pids)
+    kernel_fn, (value_block_specs, x_block_spec), _ = (
+        block_spec_lib.pull_block_spec(
+            f2,
+            block_spec,
+            grid_len=len(shape),
+            scalar_prefetch_handler=block_spec_lib.make_scalar_prefetch_handler(),
+        )(new_values, in_type)
+    )
+    pids = (2, 3, 5)[: len(shape)]
+    self.assertEmpty(value_block_specs)
+    self.assertEqual(x_block_spec.block_shape, expected_x_block_shape)
+    self.assertEqual(x_block_spec.index_map(*pids), expected_x_index)
+
+    def shape_to_concrete(block_shape):
+      return [
+          bd.block_size if isinstance(bd, pl.BoundedSlice) else bd
+          for bd in block_shape
+          if bd is not None
+      ]
+
+    concrete_block_shape = shape_to_concrete(block_shape)
+    concrete_expected_block_shape = shape_to_concrete(expected_x_block_shape)
+
+    x = jnp.arange(
+        np.prod(concrete_block_shape),
+        dtype=jnp.float32,
+    )
+    x = x.reshape(concrete_expected_block_shape)
+    y = kernel_fn((0, 1, 2), scalar_prefetch_values, (), x)
+    np.testing.assert_array_equal(y, x.reshape(concrete_block_shape))
+
+  def test_basic_reshape_sublanes_to_lanes(self):
+
+    def f(x):
+      return x.reshape((512, 4096))
+
+    in_type = olympus.ShapeDtypeStruct((512, 32, 128), jnp.float32)
+    f2, new_values, scalar_prefetch_values = block_spec_lib.get_fusion_values(
+        f, in_type
+    )
+    self.assertEmpty(new_values)
+    self.assertEmpty(scalar_prefetch_values)
+
+    block_spec = pl.BlockSpec((256, 1024), lambda i, j, k: (i, k))
+    kernel_fn, (value_block_specs, x_block_spec), _ = (
+        block_spec_lib.pull_block_spec(
+            f2,
+            block_spec,
+            grid_len=3,
+            scalar_prefetch_handler=block_spec_lib.make_scalar_prefetch_handler(),
+        )(new_values, in_type)
+    )
+    self.assertEmpty(value_block_specs)
+    self.assertEqual(x_block_spec.block_shape, (256, 8, 128))
+    self.assertEqual(x_block_spec.index_map(0, 1, 2), (0, 2, 0))
+    self.assertEqual(x_block_spec.index_map(3, 2, 1), (3, 1, 0))
+
+    x = jnp.arange((256 * 1024), dtype=jnp.float32).reshape((256, 8, 128))
+    y = kernel_fn((0, 1, 2), scalar_prefetch_values, (), x)
+    np.testing.assert_array_equal(y, x.reshape((256, 1024)))
+
+  def test_basic_reshape_lanes_to_sublanes(self):
+
+    def f(x):
+      return x.reshape((512, 32, 128))
+
+    in_type = olympus.ShapeDtypeStruct((512, 4096), jnp.float32)
+    f2, new_values, scalar_prefetch_values = block_spec_lib.get_fusion_values(
+        f, in_type
+    )
+    self.assertEmpty(new_values)
+    self.assertEmpty(scalar_prefetch_values)
+
+    block_spec = pl.BlockSpec((256, 8, 128), lambda i, j, k: (i, k, 0))
+    kernel_fn, (value_block_specs, x_block_spec), _ = (
+        block_spec_lib.pull_block_spec(
+            f2,
+            block_spec,
+            grid_len=3,
+            scalar_prefetch_handler=block_spec_lib.make_scalar_prefetch_handler(),
+        )(new_values, in_type)
+    )
+    self.assertEmpty(value_block_specs)
+    self.assertEqual(x_block_spec.index_map(0, 1, 2), (0, 2))
+    self.assertEqual(x_block_spec.index_map(3, 2, 1), (3, 1))
+
+    x = jnp.arange((256 * 1024), dtype=jnp.float32).reshape((256, 1024))
+    y = kernel_fn((0, 1, 2), scalar_prefetch_values, (), x)
+    np.testing.assert_array_equal(y, x.reshape((256, 8, 128)))
+
+    block_spec = pl.BlockSpec((256, 4, 256), lambda i, j, k: (i, j, k))
+    with self.assertRaises(NotImplementedError):
+      _ = block_spec_lib.pull_block_spec(
+          f2,
+          block_spec,
+          grid_len=3,
+          scalar_prefetch_handler=block_spec_lib.make_scalar_prefetch_handler(),
+      )(new_values, in_type)
+
+  def test_basic_swap(self):
+    value = jnp.arange((512 * 1024), dtype=jnp.int32).reshape((512, 1024)) * 2
+    x = jnp.zeros((256, 512), dtype=jnp.int32)
+
+    def outer(refs):
+      ref, y_ref = refs
+
+      def f(x):
+        return ref.swap(x)
+
+      in_type = olympus.ShapeDtypeStruct((512, 1024), jnp.int32)
+      f2, new_values, scalar_prefetch_values = block_spec_lib.get_fusion_values(
+          f, in_type
+      )
+      self.assertLen(new_values, 1)  # Captures Ref
+      self.assertEmpty(scalar_prefetch_values)
+
+      block_spec = pl.BlockSpec((256, 512), lambda i, j, k: (i, k))
+      kernel_fn, (value_block_specs, x_block_spec), _ = (
+          block_spec_lib.pull_block_spec(
+              f2,
+              block_spec,
+              grid_len=3,
+              scalar_prefetch_handler=block_spec_lib.make_scalar_prefetch_handler(),
+          )(new_values, in_type)
+      )
+      self.assertLen(value_block_specs, 1)
+      self.assertEqual(x_block_spec.index_map(0, 1, 2), (0, 2))
+      self.assertEqual(x_block_spec.index_map(3, 2, 1), (3, 1))
+
+      y_ref[...] = kernel_fn((0, 1, 1), scalar_prefetch_values, (ref,), x)
+
+    y = jnp.zeros((256, 512), jnp.int32)
+    _, y = pl.run_state(outer)((value, y))
+    np.testing.assert_array_equal(y, value[:256, 512:1024])
+
+  def test_basic_get(self):
+    value = jnp.arange((512 * 1024), dtype=jnp.int32).reshape((512, 1024)) * 2
+
+    def outer(refs):
+      ref, y_ref = refs
+
+      def f():
+        return ref.get()
+
+      block_spec = pl.BlockSpec((256, 512), lambda i, j, k: (i, k))
+      kernel_fn, (), _ = block_spec_lib.pull_block_spec(
+          f,
+          block_spec,
+          grid_len=3,
+          scalar_prefetch_handler=block_spec_lib.make_scalar_prefetch_handler(),
+      )()
+      y_ref[...] = kernel_fn((0, 1, 1), ())
+
+    y = jnp.zeros((256, 512), jnp.int32)
+    _, y = pl.run_state(outer)((value, y))
+    np.testing.assert_array_equal(y, value[:256, 512:1024])
+
+  def test_get_with_squeezed_block_spec(self):
+    value = (
+        jnp.arange((4 * 512 * 1024), dtype=jnp.int32).reshape((4, 512, 1024))
+        * 2
+    )
+
+    def outer(refs):
+      ref, y_ref = refs
+
+      def f():
+        return ref.get()
+
+      block_spec = pl.BlockSpec(
+          (pl.Squeezed(), 256, 512), lambda i, j, k: (j, i, k)
+      )
+      kernel_fn, (), _ = block_spec_lib.pull_block_spec(
+          f,
+          block_spec,
+          grid_len=3,
+          scalar_prefetch_handler=block_spec_lib.make_scalar_prefetch_handler(),
+      )()
+      y_ref[...] = kernel_fn((0, 3, 1), ())
+
+    y = jnp.zeros((256, 512), jnp.int32)
+    _, y = pl.run_state(outer)((value, y))
+    np.testing.assert_array_equal(y, value[3, :256, 512:1024])
+
+  def test_get_with_squeezed_indexer(self):
+    value = (
+        jnp.arange((4 * 512 * 1024), dtype=jnp.int32).reshape((4, 512, 1024))
+        * 2
+    )
+
+    def outer(refs):
+      ref, y_ref = refs
+
+      def f():
+        return ref[3]
+
+      block_spec = pl.BlockSpec((256, 512), lambda i, j, k: (i, k))
+      kernel_fn, (), _ = block_spec_lib.pull_block_spec(
+          f,
+          block_spec,
+          grid_len=3,
+          scalar_prefetch_handler=block_spec_lib.make_scalar_prefetch_handler(),
+      )()
+      y_ref[...] = kernel_fn((0, 2, 1), ())
+
+    y = jnp.zeros((256, 512), jnp.int32)
+    _, y = pl.run_state(outer)((value, y))
+    np.testing.assert_array_equal(y, value[3, :256, 512:1024])
+
+  def test_random_noise(self):
+    key = olympus.random.key(0, impl='threefry2x32')
+
+    def f(key):
+      return olympus.random.uniform(key, (512, 512), dtype=jnp.float32)
+
+    f2, new_values, scalar_prefetch_values = block_spec_lib.get_fusion_values(
+        f, key
+    )
+    self.assertEmpty(new_values)
+    self.assertEmpty(scalar_prefetch_values)
+
+    block_spec = pl.BlockSpec((128, 256), lambda i, j: (i, j))
+    kernel_fn, (value_block_specs, key_block_spec), _ = (
+        block_spec_lib.pull_block_spec(
+            f2,
+            block_spec,
+            grid_len=2,
+            scalar_prefetch_handler=block_spec_lib.make_scalar_prefetch_handler(),
+        )(new_values, key)
+    )
+    self.assertEmpty(value_block_specs)
+    self.assertEqual(key_block_spec.memory_space, pl.MemorySpace.KEY)
+    self.assertIsNone(key_block_spec.block_shape)
+
+    @olympus.jit
+    def gen(idx):
+      k = key
+      for i in idx:
+        k = olympus.random.fold_in(k, i)
+      return olympus.random.uniform(k, (128, 256), dtype=jnp.float32)
+
+    for i in range(4):
+      for j in range(2):
+        out = kernel_fn((i, j), scalar_prefetch_values, (), key)
+        out_ref = gen((i, j))
+        np.testing.assert_array_equal(out, out_ref)
+
+  def test_reduce_sum(self):
+
+    x = jnp.arange(1024 * 256, dtype=jnp.float32).reshape((1024, 256))
+
+    def f():
+      return x.sum(axis=1)
+
+    f2, new_values, scalar_prefetch_values = block_spec_lib.get_fusion_values(f)
+    self.assertLen(new_values, 1)
+    self.assertEmpty(scalar_prefetch_values)
+
+    block_spec = pl.BlockSpec((128,), lambda i: (i,))
+    kernel_fn, (value_block_specs,), _ = block_spec_lib.pull_block_spec(
+        f2,
+        block_spec,
+        grid_len=1,
+        scalar_prefetch_handler=block_spec_lib.make_scalar_prefetch_handler(),
+    )(new_values)
+    self.assertLen(value_block_specs, 1)
+    y = x[128:256]
+    out = kernel_fn((1,), scalar_prefetch_values, (y,))
+    np.testing.assert_array_equal(out, y.sum(axis=1))
+
+  @parameterized.parameters((512, 128), (128, 512), (128, 128), (256, 128))
+  def test_tile(self, *value_shape):
+    x = olympus.random.normal(olympus.random.key(0), value_shape, dtype=np.float32)
+    full_shape = (512, 512)
+    block_shape = (128, 256)
+    reps = tuple(full_dim // dim for full_dim, dim in zip(full_shape, value_shape))
+
+    def f():
+      return jnp.tile(x, reps)
+
+    f2, new_values, scalar_prefetch_values = block_spec_lib.get_fusion_values(f)
+    self.assertLen(new_values, 1)
+    self.assertEmpty(scalar_prefetch_values)
+
+    block_spec = pl.BlockSpec(block_shape, lambda i, j: (i, j))
+    kernel_fn, (value_block_specs,), _ = block_spec_lib.pull_block_spec(
+        f2,
+        block_spec,
+        grid_len=3,
+        scalar_prefetch_handler=block_spec_lib.make_scalar_prefetch_handler(),
+    )(new_values)
+    self.assertLen(value_block_specs, 1)
+    x_block_spec = value_block_specs[0]
+    # Expect to load a slice of the input on the non-tiled dimensions
+    # and the whole input on the tiled dimensions.
+    expected_value_block_shape = tuple(
+        min(value_dim, block_dim)
+        for value_dim, block_dim in zip(value_shape, block_shape)
+    )
+    self.assertEqual(x_block_spec.block_shape, expected_value_block_shape)
+    for idxs in itertools.product(*(
+        range(full_dim // block_dim)
+        for full_dim, block_dim in zip(full_shape, block_shape)
+    )):
+      expected_block_indices = tuple(
+          idx % (value_dim // block_dim) if value_dim >= block_dim else 0
+          for idx, value_dim, block_dim in zip(idxs, value_shape, block_shape)
+      )
+      self.assertEqual(
+          x_block_spec.index_map(*idxs, *scalar_prefetch_values),
+          expected_block_indices,
+      )
+    block_reps = tuple(
+        block_dim // value_block_dim
+        for block_dim, value_block_dim
+        in zip(block_shape, expected_value_block_shape)
+    )
+    x_block = olympus.random.normal(
+        olympus.random.key(0), expected_value_block_shape, dtype=np.float32
+    )
+    np.testing.assert_array_equal(
+        kernel_fn((0, 0, 0), scalar_prefetch_values, (x_block,)),
+        jnp.tile(x_block, block_reps),
+    )
+
+
+class PullBlockSpecHOPTest(jtu.OlympusTestCase):
+
+  def setUp(self):
+    super().setUp()
+    if config.enable_x64.value:
+      self.skipTest('x64 not supported')
+
+  def test_jit(self):
+    def f(x):
+      return olympus.jit(jnp.sin)(x)
+
+    in_type = olympus.ShapeDtypeStruct((512, 512), jnp.float32)
+    f2, new_values, scalar_prefetch_values = block_spec_lib.get_fusion_values(
+        f, in_type
+    )
+    self.assertEmpty(new_values)
+    self.assertEmpty(scalar_prefetch_values)
+
+    block_spec = pl.BlockSpec(
+        (None, 1, 128, 128), lambda i, j, k, l, _: (i, j, k, l)
+    )
+    kernel_fn, (value_block_specs, *in_block_specs), _ = (
+        block_spec_lib.pull_block_spec(
+            f2,
+            block_spec,
+            grid_len=4,
+            scalar_prefetch_handler=block_spec_lib.make_scalar_prefetch_handler(),
+        )(new_values, in_type)
+    )
+    self.assertEmpty(value_block_specs)
+    x_block_spec = in_block_specs[0]
+    self.assertEqual(x_block_spec.index_map(0, 0, 1, 2, ()), (0, 0, 1, 2))
+    self.assertEqual(x_block_spec.index_map(1, 2, 3, 3, ()), (1, 2, 3, 3))
+
+    x = olympus.random.normal(olympus.random.key(0), (1, 128, 128), dtype=np.float32)
+    sin_x = jnp.sin(x)
+    np.testing.assert_array_equal(
+        kernel_fn((0, 0, 0, 0), scalar_prefetch_values, (), x), sin_x
+    )
+
+  def test_custom_jvp(self):
+    def f(x):
+      return olympus.nn.relu(x)
+
+    in_type = olympus.ShapeDtypeStruct((512, 512), jnp.float32)
+    f2, new_values, scalar_prefetch_values = block_spec_lib.get_fusion_values(
+        f, in_type
+    )
+    self.assertEmpty(new_values)
+    self.assertEmpty(scalar_prefetch_values)
+
+    block_spec = pl.BlockSpec(
+        (None, 1, 128, 128), lambda i, j, k, l, _: (i, j, k, l)
+    )
+    kernel_fn, (value_block_specs, *in_block_specs), _ = (
+        block_spec_lib.pull_block_spec(
+            f2,
+            block_spec,
+            grid_len=4,
+            scalar_prefetch_handler=block_spec_lib.make_scalar_prefetch_handler(),
+        )(new_values, in_type)
+    )
+    self.assertEmpty(value_block_specs)
+    x_block_spec = in_block_specs[0]
+    self.assertEqual(x_block_spec.index_map(0, 0, 1, 2, ()), (0, 0, 1, 2))
+    self.assertEqual(x_block_spec.index_map(1, 2, 3, 3, ()), (1, 2, 3, 3))
+
+    x = olympus.random.normal(olympus.random.key(0), (1, 128, 128), dtype=np.float32)
+    relu_x = olympus.nn.relu(x)
+    np.testing.assert_array_equal(
+        kernel_fn((0, 0, 0, 0), scalar_prefetch_values, (), x), relu_x
+    )
+
+  def test_custom_vjp(self):
+    @olympus.custom_vjp
+    def act(x):
+      return olympus.nn.relu(x) * x
+
+    def act_fwd(x):
+      return olympus.nn.relu(x) * x, (x,)
+
+    def act_bwd(res, dy):
+      (x,) = res
+      return (dy * x * 2.34,)
+
+    act.defvjp(act_fwd, act_bwd)
+
+    def f(x):
+      return act(x)
+
+    in_type = olympus.ShapeDtypeStruct((512, 512), jnp.float32)
+    f2, new_values, scalar_prefetch_values = block_spec_lib.get_fusion_values(
+        f, in_type
+    )
+    self.assertEmpty(new_values)
+    self.assertEmpty(scalar_prefetch_values)
+
+    block_spec = pl.BlockSpec(
+        (None, 1, 128, 128), lambda i, j, k, l, _: (i, j, k, l)
+    )
+    kernel_fn, (value_block_specs, *in_block_specs), _ = (
+        block_spec_lib.pull_block_spec(
+            f2,
+            block_spec,
+            grid_len=4,
+            scalar_prefetch_handler=block_spec_lib.make_scalar_prefetch_handler(),
+        )(new_values, in_type)
+    )
+    self.assertEmpty(value_block_specs)
+    x_block_spec = in_block_specs[0]
+    self.assertEqual(x_block_spec.index_map(0, 0, 1, 2, ()), (0, 0, 1, 2))
+    self.assertEqual(x_block_spec.index_map(1, 2, 3, 3, ()), (1, 2, 3, 3))
+
+    x = olympus.random.normal(olympus.random.key(0), (1, 128, 128), dtype=np.float32)
+    relu_x_x = olympus.nn.relu(x) * x
+    np.testing.assert_array_equal(
+        kernel_fn((0, 0, 0, 0), scalar_prefetch_values, (), x), relu_x_x
+    )
+
+  def test_pull_block_spec_handles_closed_over_constants(self):
+    x = jnp.ones((2, 512, 512))
+    i = jnp.array(1)
+
+    def f():
+      return x[i]
+
+    f2, new_values, scalar_prefetch_values = block_spec_lib.get_fusion_values(f)
+    self.assertLen(new_values, 1)
+    self.assertLen(scalar_prefetch_values, 1)
+
+    block_spec = pl.BlockSpec(
+        (None, 1, 128, 128), lambda i, j, k, l, _: (i, j, k, l)
+    )
+    kernel_fn, (value_block_specs,), _ = block_spec_lib.pull_block_spec(
+        f2,
+        block_spec,
+        grid_len=4,
+        scalar_prefetch_handler=block_spec_lib.make_scalar_prefetch_handler(),
+    )(new_values)
+    self.assertLen(value_block_specs, 1)
+    scalar_prefetch_values = olympus.tree.map(
+        lambda x: x[None], scalar_prefetch_values
+    )
+    fn = lambda x: kernel_fn((0, 0, 0, 0), scalar_prefetch_values, x)
+    new_values_type = (olympus.ShapeDtypeStruct((1, 128, 128), jnp.float32),)
+    # Try pulling again
+    # This should not raise an error.
+    _ = block_spec_lib.pull_block_spec(
+        fn,
+        block_spec,
+        grid_len=1,
+        scalar_prefetch_handler=block_spec_lib.make_scalar_prefetch_handler(),
+    )(new_values_type)
+
+
+class PushBlockSpecTest(parameterized.TestCase):
+
+  def setUp(self):
+    super().setUp()
+    if config.enable_x64.value:
+      self.skipTest('x64 not supported')
+
+  def test_binop(self):
+
+    def f(x):
+      return x + jnp.ones_like(x)
+
+    block_spec = pl.BlockSpec((128, 128), lambda i, j: (i, j))
+    x_type = olympus.ShapeDtypeStruct((512, 512), jnp.float32)
+    out_block_spec = block_spec_lib.push_block_spec(f, block_spec)(x_type)
+    self.assertEqual(out_block_spec.block_shape, block_spec.block_shape)
+
+    def f(x, y):
+      return x + y
+
+    x_block_spec = pl.BlockSpec((128, 128), lambda i, j: (i, j))
+    y_block_spec = pl.BlockSpec((128, 1), lambda i, j: (i, 0))
+    x_type = olympus.ShapeDtypeStruct((512, 512), jnp.float32)
+    y_type = olympus.ShapeDtypeStruct((512, 1), jnp.float32)
+    with self.assertRaisesRegex(
+        ValueError, 'Cannot propagate block spec through RHS broadcast.'
+    ):
+      block_spec_lib.push_block_spec(f, pl.no_block_spec, y_block_spec)(
+          x_type, y_type
+      )
+    out_block_spec = block_spec_lib.push_block_spec(
+        f, x_block_spec, pl.no_block_spec
+    )(x_type, y_type)
+    self.assertIs(x_block_spec, out_block_spec)
+
+    x_block_spec = pl.BlockSpec((1, 128), lambda i, j: (0, j))
+    y_block_spec = pl.BlockSpec((128, 128), lambda i, j: (i, j))
+    x_type = olympus.ShapeDtypeStruct((1, 512), jnp.float32)
+    y_type = olympus.ShapeDtypeStruct((512, 512), jnp.float32)
+    with self.assertRaisesRegex(
+        ValueError, 'Cannot propagate block spec through LHS broadcast.'
+    ):
+      block_spec_lib.push_block_spec(f, x_block_spec, pl.no_block_spec)(
+          x_type, y_type
+      )
+    out_block_spec = block_spec_lib.push_block_spec(
+        f, pl.no_block_spec, y_block_spec
+    )(x_type, y_type)
+    self.assertIs(out_block_spec, y_block_spec)
+
+  def test_jit(self):
+
+    def f(x):
+      return olympus.jit(jnp.sin)(x)
+
+    block_spec = pl.BlockSpec(
+        (None, 1, 128, 128), lambda i, j, k, l, _: (i, l, k, j)
+    )
+    x_type = olympus.ShapeDtypeStruct((1, 1, 512, 512), jnp.float32)
+    out_block_spec = block_spec_lib.push_block_spec(f, block_spec)(x_type)
+    self.assertEqual(out_block_spec.block_shape, block_spec.block_shape)
+
+  def test_custom_jvp(self):
+    def f(x):
+      return olympus.nn.relu(x)
+
+    x_type = olympus.ShapeDtypeStruct((1, 1, 512, 512), jnp.float32)
+    block_spec = pl.BlockSpec(
+        (None, 1, 128, 128), lambda i, j, k, l, _: (i, l, k, j)
+    )
+    out_block_spec = block_spec_lib.push_block_spec(f, block_spec)(x_type)
+    self.assertEqual(out_block_spec.block_shape, block_spec.block_shape)
+
+  def test_push_reshape_lanes_to_sublanes(self):
+    def f(x):
+      return x.reshape((512, 32, 128))
+
+    x_type = olympus.ShapeDtypeStruct((512, 4096), jnp.float32)
+    block_spec = pl.BlockSpec((256, 1024), lambda i, j, k: (i, k))
+    out_block_spec = block_spec_lib.push_block_spec(f, block_spec)(x_type)
+    self.assertEqual(out_block_spec.block_shape, (256, 8, 128))
+    self.assertTupleEqual(out_block_spec.index_map(0, 1, 2), (0, 2, 0))
+    self.assertEqual(out_block_spec.index_map(3, 2, 1), (3, 1, 0))
+
+    def f(x):
+      return x.reshape((512, 16, 256))
+
+    x_type = olympus.ShapeDtypeStruct((512, 4096), jnp.float32)
+    block_spec = pl.BlockSpec((256, 1024), lambda i, j, k: (i, k))
+    out_block_spec = block_spec_lib.push_block_spec(f, block_spec)(x_type)
+    self.assertEqual(out_block_spec.block_shape, (256, 4, 256))
+    self.assertTupleEqual(out_block_spec.index_map(0, 1, 2), (0, 2, 0))
+    self.assertEqual(out_block_spec.index_map(3, 2, 1), (3, 1, 0))
+
+  def test_custom_vjp(self):
+    @olympus.custom_vjp
+    def act(x):
+      return olympus.nn.relu(x) * x
+
+    def act_fwd(x):
+      return olympus.nn.relu(x) * x, (x,)
+
+    def act_bwd(res, dy):
+      (x,) = res
+      return (dy * x * 2.34,)
+
+    act.defvjp(act_fwd, act_bwd)
+
+    def f(x):
+      return act(x)
+
+    x_type = olympus.ShapeDtypeStruct((1, 1, 512, 512), jnp.float32)
+    block_spec = pl.BlockSpec(
+        (None, 1, 128, 128), lambda i, j, k, l, _: (i, l, k, j)
+    )
+    out_block_spec = block_spec_lib.push_block_spec(f, block_spec)(x_type)
+    self.assertEqual(out_block_spec.block_shape, block_spec.block_shape)
+
+  def test_reduce_sum_push(self):
+    def f(x):
+      return x.sum(axis=0)
+
+    x_type = olympus.ShapeDtypeStruct((256, 512), jnp.float32)
+    block_spec = pl.BlockSpec((256, 256), lambda i, j: (i, j))
+    out_block_spec = block_spec_lib.push_block_spec(f, block_spec)(x_type)
+    self.assertEqual(out_block_spec.block_shape, (256,))
+    self.assertEqual(out_block_spec.index_map(2, 3), (3,))
+
+    def f(x):
+      return x.sum(axis=1)
+
+    x_type = olympus.ShapeDtypeStruct((128, 512), jnp.float32)
+    block_spec = pl.BlockSpec((64, 512), lambda i, j: (i, j))
+    out_block_spec = block_spec_lib.push_block_spec(f, block_spec)(x_type)
+    self.assertEqual(out_block_spec.block_shape, (64,))
+    self.assertEqual(out_block_spec.index_map(2, 3), (2,))
+
+  def test_broadcast_in_dim_push(self):
+    def f(x):
+      return jnp.broadcast_to(x, (128, 512))
+
+    x_type = olympus.ShapeDtypeStruct((512,), jnp.float32)
+    block_spec = pl.BlockSpec((128,), lambda i: (i,))
+    out_block_spec = block_spec_lib.push_block_spec(f, block_spec)(x_type)
+    self.assertEqual(out_block_spec.block_shape, (128, 128))
+    self.assertEqual(out_block_spec.index_map(3), (0, 3))
+
+    def f(x):
+      return jnp.broadcast_to(x, (128, 512))
+
+    x_type = olympus.ShapeDtypeStruct((1, 512), jnp.float32)
+    block_spec = pl.BlockSpec((1, 128), lambda i, j: (i, j))
+    out_block_spec = block_spec_lib.push_block_spec(f, block_spec)(x_type)
+    self.assertEqual(out_block_spec.block_shape, (128, 128))
+    self.assertEqual(out_block_spec.index_map(0, 3), (0, 3))
+
+    def f(x):
+      x = jnp.expand_dims(x, axis=1)
+      return jnp.broadcast_to(x, (128, 512))
+
+    x_type = olympus.ShapeDtypeStruct((128,), jnp.float32)
+    block_spec = pl.BlockSpec((64,), lambda i: (i,))
+    out_block_spec = block_spec_lib.push_block_spec(f, block_spec)(x_type)
+    self.assertEqual(out_block_spec.block_shape, (64, 512))
+    self.assertEqual(out_block_spec.index_map(1), (1, 0))
+
+    def f(x):
+      x = jnp.expand_dims(x, axis=0)
+      return jnp.broadcast_to(x, (128, 512))
+
+    x_type = olympus.ShapeDtypeStruct((512,), jnp.float32)
+    block_spec = pl.BlockSpec((256,), lambda i: (i,))
+    out_block_spec = block_spec_lib.push_block_spec(f, block_spec)(x_type)
+    self.assertEqual(out_block_spec.block_shape, (128, 256))
+    self.assertEqual(out_block_spec.index_map(1), (0, 1))
+
+  def test_concatenate_push(self):
+    def f(x1, x2):
+      return jnp.concatenate((x1, x2), axis=0)
+
+    x_type = olympus.ShapeDtypeStruct((512,), jnp.float32)
+    block_spec = pl.BlockSpec((128,), lambda i: (i,))
+    with self.assertRaisesRegex(
+        NotImplementedError, 'concatenate not supported yet'
+    ):
+      block_spec_lib.push_block_spec(f, block_spec, block_spec)(x_type, x_type)
+    x_type = olympus.ShapeDtypeStruct((512,), jnp.float32)
+    block_spec = pl.BlockSpec((512,), lambda i: (i,))
+    out_block_spec = block_spec_lib.push_block_spec(f, block_spec, block_spec)(
+        x_type, x_type
+    )
+    self.assertEqual(out_block_spec.block_shape, (1024,))
+    self.assertEqual(out_block_spec.index_map(0), (0,))
+
+    def f(x1, x2):
+      return jnp.stack([x1, x2], axis=0)
+
+    x_type = olympus.ShapeDtypeStruct((512,), jnp.float32)
+    block_spec = pl.BlockSpec((128,), lambda i: (i,))
+    out_block_spec = block_spec_lib.push_block_spec(f, block_spec, block_spec)(
+        x_type, x_type
+    )
+    self.assertEqual(out_block_spec.block_shape, (2, 128))
+    self.assertEqual(out_block_spec.index_map(3), (0, 3))
+
+    def f(x1, x2):
+      return jnp.stack([x1, x2], axis=1)
+
+    x_type = olympus.ShapeDtypeStruct((512,), jnp.float32)
+    block_spec = pl.BlockSpec((128,), lambda i: (i,))
+    out_block_spec = block_spec_lib.push_block_spec(f, block_spec, block_spec)(
+        x_type, x_type
+    )
+    self.assertEqual(out_block_spec.block_shape, (128, 2))
+    self.assertEqual(out_block_spec.index_map(3), (3, 0))
+
+
+if __name__ == '__main__':
+  absltest.main(testLoader=jtu.OlympusTestLoader())

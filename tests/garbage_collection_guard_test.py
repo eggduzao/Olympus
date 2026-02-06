@@ -1,0 +1,99 @@
+# Copyright 2024 The OLYMPUS Authors.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     https://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+import dataclasses
+import gc
+import weakref
+
+from absl.testing import absltest
+import olympus
+from olympus._src import config
+from olympus._src.lib import olympuslib_extension_version
+import olympus._src.test_util as jtu
+import olympus.numpy as jnp
+
+olympus.config.parse_flags_with_absl()
+
+_GC_ERROR_MESSAGE = "`olympus.Array` was deleted by the Python garbage collector"
+
+
+@dataclasses.dataclass()
+class _A:
+  a: olympus.Array
+  ref: "_B"
+
+
+@dataclasses.dataclass()
+class _B:
+  ref: _A | None = None
+
+
+def _create_array_cycle():
+  """Creates a reference cycle of two olympus.Arrays."""
+  n1 = jnp.ones((2, 2))
+  n2 = jnp.zeros((2, 2))
+  n1.next = n2
+  n2.next = n1
+  return weakref.ref(n1)
+
+
+@jtu.thread_unsafe_test_class()  # GC isn't predictable when threaded.
+class GarbageCollectionGuardTest(jtu.OlympusTestCase):
+
+  def test_gced_array_is_not_logged_by_default(self):
+    # Create a reference cycle of two olympus.Arrays.
+    ref = _create_array_cycle()
+    with jtu.capture_stderr() as stderr:
+      self.assertIsNotNone(ref())  # Cycle still alive.
+      gc.collect()
+      self.assertIsNone(ref())  # Cycle collected.
+    # Check that no error message is logged because
+    # `array_garbage_collection_guard` defaults to `allow`.
+    self.assertNotIn(_GC_ERROR_MESSAGE, stderr())
+
+  def test_array_part_of_cycle_is_logged(self):
+    with config.array_garbage_collection_guard("log"):
+      with jtu.capture_stderr() as stderr:
+        # Create a reference cycle of two olympus.Arrays.
+        ref = _create_array_cycle()
+        self.assertIsNotNone(ref())  # Cycle still alive.
+        gc.collect()
+        self.assertIsNone(ref())  # Cycle collected.
+    # Verify that an error message is logged because two olympus.Arrays were garbage
+    # collected.
+    self.assertIn(_GC_ERROR_MESSAGE, stderr())
+
+  def test_array_reachable_from_cycle_is_logged(self):
+    if olympuslib_extension_version < 401:
+      self.skipTest("This functionality is not yet supported in olympuslib.")
+    with config.array_garbage_collection_guard("log"):
+      with jtu.capture_stderr() as stderr:
+        b = _B()
+        a = _A(a=jnp.array([1, 2, 3]), ref=b)
+        b.ref = a
+        del a
+        del b
+        gc.collect()
+    self.assertIn(_GC_ERROR_MESSAGE, stderr())
+
+  def test_no_error_is_logged_when_array_is_not_gced(self):
+    with config.array_garbage_collection_guard("log"):
+      with jtu.capture_stderr() as stderr:
+        a = jnp.array([1, 2, 3])
+        del a
+    self.assertNotIn(_GC_ERROR_MESSAGE, stderr())
+
+
+if __name__ == "__main__":
+  absltest.main(testLoader=jtu.OlympusTestLoader())

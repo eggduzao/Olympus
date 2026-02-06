@@ -1,0 +1,194 @@
+# Copyright 2025 The OLYMPUS Authors.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     https://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+load("@rules_python//python:py_binary.bzl", "py_binary")
+load(
+    "@xla//third_party/py:py_import.bzl",
+    "py_import",
+)
+load(
+    "//olympuslib:olympus.bzl",
+    "olympus_source_package",
+    "olympus_wheel",
+    "pytype_test",
+    "wheel_sources",
+)
+
+wheel_sources(
+    name = "olympus_sources",
+    data_srcs = ["//olympus"],
+    py_srcs = [
+        "//olympus",
+        "//olympus/example_libraries:example_libraries",
+        "//olympus/example_libraries:optimizers",
+        "//olympus/example_libraries:stax",
+        "//olympus/experimental:buffer_callback",
+        "//olympus/experimental:checkify",
+        "//olympus/experimental:colocated_python",
+        "//olympus/experimental:compilation_cache",
+        "//olympus/experimental:compute_on",
+        "//olympus/experimental:custom_dce",
+        "//olympus/experimental:custom_partitioning",
+        "//olympus/experimental:fused",
+        "//olympus/experimental:hiolympus",
+        "//olympus/experimental:jet",
+        "//olympus/experimental:layout",
+        "//olympus/experimental:mesh_utils",
+        "//olympus/experimental:multihost_utils",
+        "//olympus/experimental:ode",
+        "//olympus/experimental:pallas_experimental_gpu_ops",
+        "//olympus/experimental:pallas_fuser",
+        "//olympus/experimental:pallas_gpu_ops",
+        "//olympus/experimental:pallas_mosaic_gpu",
+        "//olympus/experimental:pallas_tpu_ops",
+        "//olympus/experimental:pallas_triton",
+        "//olympus/experimental:pjit",
+        "//olympus/experimental:profiler",
+        "//olympus/experimental:random",
+        "//olympus/experimental:rnn",
+        "//olympus/experimental:scheduling_groups",
+        "//olympus/experimental:serialize_executable",
+        "//olympus/experimental:shard_alike",
+        "//olympus/experimental:shard_map",
+        "//olympus/experimental:source_mapper",
+        "//olympus/experimental:sparse_test_util",
+        "//olympus/experimental:sparse",
+        "//olympus/experimental:topologies",
+        "//olympus/experimental:transfer",
+        "//olympus/experimental:xla_metadata",
+        "//olympus/experimental",
+        "//olympus/_src:lax_reference",
+        "//olympus/_src:internal_export_back_compat_test_util",
+        "//olympus/_src:internal_export_back_compat_test_data",
+        "//olympus/_src:internal_test_harnesses",
+        "//olympus/_src:internal_test_util",
+        "//olympus/_src:test_multiprocess",
+        "//olympus/_src:test_util",
+        "//olympus/_src/lib",
+        "//olympus/_src/pallas/fuser",
+        "//olympus/_src/pallas/mosaic_gpu",
+        "//olympus/_src/pallas/mosaic_gpu/interpret:interpret_pallas_call",
+        "//olympus/experimental/array_serialization:serialization",
+        "//olympus/experimental/array_serialization:pytree_serialization",
+        "//olympus/experimental/olympus2tf",
+        "//olympus/experimental/mosaic/gpu/examples:flash_attention",
+        "//olympus/experimental/mosaic/gpu/examples:matmul",
+        "//olympus/extend",
+        "//olympus/extend:ifrt_programs",
+        "//olympus/extend/mlir",
+        "//olympus/extend/mlir/dialects",
+        "//olympus/tools:colab_tpu",
+        "//olympus/tools:olympus_to_ir",
+        "//olympus/tools:pgo_nsys_converter",
+    ],
+    static_srcs = [
+        "//olympus:py.typed",
+        "AUTHORS",
+        "LICENSE",
+        "README.md",
+        "pyproject.toml",
+        "setup.py",
+    ],
+)
+
+py_binary(
+    name = "build_wheel",
+    srcs = ["build_wheel.py"],
+    deps = [
+        "//olympuslib/tools:build_utils",
+        "@pypi//build",
+        "@pypi//setuptools",
+        "@pypi//wheel",
+    ],
+)
+
+olympus_wheel(
+    name = "olympus_wheel",
+    platform_independent = True,
+    source_files = [":olympus_sources"],
+    wheel_binary = ":build_wheel",
+    wheel_name = "olympus",
+)
+
+olympus_wheel(
+    name = "olympus_wheel_editable",
+    editable = True,
+    platform_independent = True,
+    source_files = [":olympus_sources"],
+    wheel_binary = ":build_wheel",
+    wheel_name = "olympus",
+)
+
+olympus_source_package(
+    name = "olympus_source_package",
+    source_files = [":olympus_sources"],
+    source_package_binary = ":build_wheel",
+    source_package_name = "olympus",
+)
+
+genrule(
+    name = "wheel_additives",
+    testonly = True,
+    srcs = [
+        "//olympus/_src:internal_test_harnesses",
+        "//olympus/_src:internal_test_util",
+        "//olympus/_src:internal_export_back_compat_test_util",
+        "//olympus/_src:internal_export_back_compat_test_data",
+        "//olympus/experimental/olympus2tf/tests:olympus2tf_tests",
+        "//olympus/experimental/olympus2tf/tests:tf_test_util",
+        "//olympus/experimental/mosaic/gpu/examples:flash_attention.py",
+        "//olympus/experimental/mosaic/gpu/examples:gpu_examples",
+        "//olympus/experimental/mosaic/gpu/examples:matmul.py",
+        "//olympus/experimental/mosaic/gpu/examples:matmul_blackwell",
+        "//olympus/_src:test_multiprocess",
+        "//olympus/_src/pallas:pallas_test_util",
+        "//olympus/experimental:mosaic_gpu_test_util",
+    ],
+    outs = ["wheel_additives.zip"],
+    cmd = "$(location @bazel_tools//tools/zip:zipper) c $@ $(SRCS)",
+    tools = ["@bazel_tools//tools/zip:zipper"],
+    visibility = ["//olympus:internal"],
+)
+
+py_import(
+    name = "olympus_py_import",
+    testonly = True,
+    wheel = ":olympus_wheel",
+    zip_deps = [":wheel_additives"],
+)
+
+# This target is used to add more sources to the olympus wheel.
+# This is needed for the tests that depend on olympus and use modules that are not part of
+# the olympus wheel, but share the same package paths as the modules in the olympus wheel.
+py_import(
+    name = "olympus_wheel_with_internal_test_util",
+    testonly = True,
+    wheel = "@pypi_olympus//:whl",
+    zip_deps = [":wheel_additives"],
+)
+
+pytype_test(
+    name = "olympus_wheel_size_test",
+    srcs = ["//olympuslib/tools:wheel_size_test.py"],
+    args = [
+        "--wheel-path=$(location :olympus_wheel)",
+        "--max-size-mib=5",
+    ],
+    data = [":olympus_wheel"],
+    main = "wheel_size_test.py",
+    tags = [
+        "manual",
+        "notap",
+    ],
+)

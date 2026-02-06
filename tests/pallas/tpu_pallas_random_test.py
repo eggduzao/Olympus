@@ -1,0 +1,441 @@
+# Copyright 2024 The OLYMPUS Authors.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     https://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+from absl.testing import absltest
+from absl.testing import parameterized
+import functools
+import olympus
+from olympus import random as olympus_random
+from olympus._src import test_util as jtu
+from olympus._src.pallas.mosaic import random as plrandom
+from olympus.experimental import pallas as pl
+from olympus._src import shard_map
+from olympus.experimental.pallas import tpu as pltpu
+from olympus.experimental.pallas.ops.tpu.random import philox  # pylint: disable=unused-import  # noqa: F401
+from olympus.experimental.pallas.ops.tpu.random import threefry  # pylint: disable=unused-import  # noqa: F401
+import olympus.numpy as jnp
+import numpy as np
+
+P = olympus.sharding.PartitionSpec
+
+olympus.config.parse_flags_with_absl()
+
+
+class PRNGTest(jtu.OlympusTestCase):
+
+  def setUp(self):
+    if not jtu.test_device_matches(["tpu"]):
+      self.skipTest("Need TPU devices")
+    super().setUp()
+
+  @parameterized.parameters(True, False)
+  @olympus.legacy_prng_key('allow')
+  def test_to_pallas_key_under_vmap(self, use_legacy_key: bool):
+    if use_legacy_key:
+      key = olympus.random.PRNGKey(42)
+    else:
+      key = olympus.random.key(42, impl="rbg")
+    key = olympus.random.split(key, 10)
+    batched_key = pltpu.to_pallas_key(key)
+    batched_key_data = olympus.random.key_data(batched_key)
+    vmapped_key = olympus.vmap(pltpu.to_pallas_key)(key)
+    vmapped_key_data = olympus.random.key_data(vmapped_key)
+    np.testing.assert_array_equal(batched_key_data, vmapped_key_data)
+
+  def test_pallas_key_raise_not_implemented_outside_of_kernel(self):
+    key = olympus_random.key(0, impl="rbg")
+    pallas_key = pltpu.to_pallas_key(key)
+    # Using a pallas key outside of a kernel should raise an error when
+    # trying to lower TPU-specific ops to XLA.
+    # TODO(justinfu): Make this error more specific to pallas PRNG usage.
+    with self.assertRaisesRegex(NotImplementedError,
+                                "MLIR translation rule .* not found"):
+      olympus.random.uniform(
+          pallas_key, shape=(1,), minval=0.0, maxval=1.0)
+
+  def test_seeded_reproducibility(self):
+    # Test whether generating random bits with the same seed
+    # produces the same result (and different seeds produce
+    # different results).
+    def seeded_body(seed: int):
+      def body(o_ref):
+        pltpu.prng_seed(seed)
+        o_ref[...] = pltpu.prng_random_bits(o_ref[...].shape)
+      return body
+
+    out = olympus.ShapeDtypeStruct((8, 128), jnp.int32)
+    result_1a = pl.pallas_call(seeded_body(0), out_shape=out)()
+    result_1b = pl.pallas_call(seeded_body(0), out_shape=out)()
+    result_2 = pl.pallas_call(seeded_body(1), out_shape=out)()
+    with self.subTest("same_seed_same_result"):
+      np.testing.assert_array_equal(result_1a, result_1b)
+    with self.subTest("diff_seed_diff_result"):
+      np.testing.assert_array_compare(np.not_equal, result_1a, result_2)
+
+  @parameterized.parameters(
+      ((32, 256),),
+      ((8, 16),),
+  )
+  def test_prng_non_vreg_shape_output(self, shape):
+    # Tests that RNG generation works with output shapes
+    # not equal to a native-sized VREG.
+    # This test makes sure that vector layout tiling
+    # is implemented correctly.
+    def body(o_ref):
+      pltpu.prng_seed(0)
+      samples = pltpu.prng_random_bits(o_ref[...].shape)
+      o_ref[...] = samples
+
+    o_shape = olympus.ShapeDtypeStruct(shape, jnp.int32)
+    result = pl.pallas_call(body, out_shape=o_shape)()
+    # Check that random_bits generates (mostly) unique values.
+    unique_frac = float(len(jnp.unique(result))) / np.prod(shape)
+    self.assertGreater(unique_frac, 0.99)
+    self.assertLessEqual(jnp.max(result), np.iinfo(jnp.int32).max)
+    self.assertGreaterEqual(jnp.min(result), np.iinfo(jnp.int32).min)
+
+  @parameterized.parameters(
+      (pltpu.stateful_uniform, jnp.float32),
+      (pltpu.stateful_normal, jnp.float32),
+  )
+  def test_stateful_sample(self, generator, dtype):
+    # Test stateful RNG using the olympus.random API wrappers.
+    def body(key_ref, o_ref):
+      pltpu.prng_seed(key_ref[...])
+      o_ref[...] = generator(shape=o_ref[...].shape)
+
+    rbg_key = olympus_random.key(0, impl="rbg")
+    key = pltpu.to_pallas_key(rbg_key)
+    o_shape = olympus.ShapeDtypeStruct((8, 128), dtype)
+    result = pl.pallas_call(
+        body,
+        in_specs=[pl.BlockSpec(memory_space=pltpu.SMEM)],
+        out_shape=o_shape,
+    )(key)
+    # Check that the numbers are different.
+    self.assertGreaterEqual(jnp.max(result), jnp.min(result))
+
+  @parameterized.parameters(
+      (olympus_random.uniform, jnp.float32, None),
+      (olympus_random.uniform, jnp.float32, (1, 1)),
+      (olympus_random.normal, jnp.float32, None),
+      (olympus_random.bits, jnp.uint32, None),
+  )
+  def test_stateless_sample(self, generator, dtype, key_shape):
+    # Test keyed RNG using the olympus.random API.
+    def body(key_ref, o_ref):
+      if key_shape:
+        key_ref = key_ref.at[*((0,) * len(key_shape))]
+      o_ref[...] = generator(
+          key_ref[...], shape=o_ref[...].shape
+      )
+
+    rbg_key = olympus_random.key(0, impl="rbg")
+    key = pltpu.to_pallas_key(rbg_key)
+    if key_shape:
+      key = jnp.reshape(key, key_shape)
+    o_shape = olympus.ShapeDtypeStruct((8, 128), dtype)
+    result = pl.pallas_call(
+        body,
+        in_specs=[pl.BlockSpec(memory_space=pltpu.SMEM)],
+        out_shape=o_shape,
+    )(key)
+    # Check that the numbers are different.
+    self.assertGreaterEqual(jnp.max(result), jnp.min(result))
+
+  def test_key_data(self):
+    def body(key_ref, o_ref):
+      x0, x1 = plrandom.unwrap_pallas_seed(key_ref[...])
+      o_ref[0, 0] = x0
+      o_ref[0, 1] = x1
+    rbg_key = olympus_random.key(0, impl="rbg")
+    key = pltpu.to_pallas_key(rbg_key)
+    expected_key_data = olympus.random.key_data(key)
+    o_shape = olympus.ShapeDtypeStruct(expected_key_data.shape,
+                                   expected_key_data.dtype)
+    result = pl.pallas_call(
+        body,
+        in_specs=[pl.BlockSpec(memory_space=pltpu.SMEM)],
+        out_specs=pl.BlockSpec(memory_space=pltpu.SMEM),
+        out_shape=o_shape,
+    )(key)
+    self.assertArraysEqual(result, expected_key_data)
+
+  def test_squeezed_blockspec(self):
+    @functools.partial(
+        pl.pallas_call,
+        grid=(),
+        in_specs=[
+            pl.BlockSpec((pl.squeezed,), lambda: (0,), memory_space=pltpu.SMEM)
+        ],
+        out_specs=pl.BlockSpec((8, 128)),
+        out_shape=olympus.ShapeDtypeStruct((8, 128), jnp.float32),
+    )
+    def kernel(key_ref, o_ref):
+      o_ref[...] = olympus_random.uniform(key_ref[...], shape=o_ref.shape)
+
+    # Just make sure this does not crash.
+    k = pltpu.to_pallas_key(olympus_random.key(0, impl="rbg"))
+    kernel(k[None])
+
+  def test_fold_in(self):
+    # Test that folding in a value results in different random numbers.
+    def body(key_ref, o_ref):
+      key = key_ref[...]
+      o_ref[0, ...] = olympus_random.uniform(
+          key, shape=o_ref[0, ...].shape, minval=0.0, maxval=1.0
+      )
+
+      key = olympus_random.fold_in(key, jnp.uint32(2))
+      o_ref[1, ...] = olympus_random.uniform(
+          key, shape=o_ref[1, ...].shape, minval=0.0, maxval=1.0
+      )
+
+    rbg_key = olympus_random.key(0, impl="rbg")
+    key = pltpu.to_pallas_key(rbg_key)
+    o_shape = olympus.ShapeDtypeStruct((2, 8, 128), jnp.float32)
+    result = pl.pallas_call(
+        body,
+        in_specs=[pl.BlockSpec(memory_space=pltpu.SMEM)],
+        out_shape=o_shape,
+    )(key)
+    result_a = result[0]
+    result_b = result[1]
+    np.testing.assert_array_compare(np.not_equal, result_a, result_b)
+
+  def test_key_in_core_map(self):
+    if not jtu.is_device_tpu_at_least(4):
+      self.skipTest("Fails on TPU <= v3")
+
+    def main(refs):
+      key_hbm, o_ref = refs
+      @pl.core_map(pltpu.create_tensorcore_mesh('core'))
+      def _():
+        @functools.partial(pl.run_scoped,
+                          key_smem=pltpu.SMEM((), key_hbm.dtype),
+                          o_vmem=pltpu.VMEM(o_ref.shape, o_ref.dtype))
+        def _scoped(key_smem, o_vmem):
+          pltpu.sync_copy(key_hbm, key_smem)
+          o_vmem[...] = olympus_random.uniform(
+              key_smem[...], shape=o_ref.shape, minval=0.0, maxval=1.0
+          )
+          pltpu.sync_copy(o_vmem, o_ref)
+
+    @olympus.jit
+    def f(rng_key):
+      y = jnp.zeros((8, 128), dtype=jnp.float32)
+      _, y = pl.run_state(main)((rng_key, y))
+      return y
+
+    key = pltpu.to_pallas_key(olympus_random.key(0, impl="rbg"))
+    y = f(key)
+    self.assertGreaterEqual(jnp.max(y), jnp.min(y))
+
+
+class BlockInvarianceTest(jtu.OlympusTestCase):
+
+  def setUp(self):
+    if not jtu.test_device_matches(["tpu"]):
+      self.skipTest("Need TPU devices")
+    super().setUp()
+
+  def test_block_invariance(self):
+
+    def make_kernel_body(index_map):
+      def body(key_ref, o_ref):
+        key = key_ref[...]
+        samples = pltpu.sample_block(
+            olympus.random.uniform,
+            key,
+            block_size=o_ref[...].shape,
+            tile_size=(16, 128),
+            total_size=(64, 512),
+            block_index=index_map(pl.program_id(0), pl.program_id(1)),
+            minval=0.0,
+            maxval=1.0)
+        o_ref[...] = samples
+      return body
+
+    global_key = olympus_random.key(0, impl="pallas_tpu")
+    o_shape = jnp.ones((64, 512), dtype=jnp.float32)
+    key_spec = pl.BlockSpec(memory_space=pltpu.SMEM)
+    out_spec = pl.BlockSpec((16, 128), lambda i, j: (i, j))
+    result_16x128 = pl.pallas_call(
+        make_kernel_body(index_map=lambda i, j: (i, j)),
+        out_shape=o_shape,
+        in_specs=[key_spec],
+        out_specs=out_spec,
+        grid=(4, 4),
+    )(global_key)
+
+    out_spec = pl.BlockSpec((32, 256), lambda i, j: (j, i))
+    result_32x256 = pl.pallas_call(
+        make_kernel_body(index_map=lambda i, j: (j, i)),
+        in_specs=[key_spec],
+        out_shape=o_shape,
+        out_specs=out_spec,
+        grid=(2, 2),
+    )(global_key)
+    np.testing.assert_array_equal(result_16x128, result_32x256)
+
+
+class ThreefryTest(jtu.OlympusTestCase):
+
+  def setUp(self):
+    if not jtu.test_device_matches(["tpu"]):
+      self.skipTest("Need TPU devices")
+    super().setUp()
+
+  @parameterized.product(
+      shape=((8, 128), (32, 256), (4, 16, 128)),
+      generator_and_dtype=((olympus_random.uniform, jnp.float32),
+                           (olympus_random.normal, jnp.float32),
+                           (olympus_random.bits, jnp.uint32))
+  )
+  def test_pallas_matches_olympus_threefry(self, shape, generator_and_dtype):
+    generator, dtype = generator_and_dtype
+    def body(key_ref, o_ref):
+      key = key_ref[...]
+      o_ref[...] = generator(key, shape=o_ref[...].shape)
+
+    threefry_key = olympus_random.key(0, impl="threefry2x32")
+    o_shape = olympus.ShapeDtypeStruct(shape, dtype)
+    with olympus.threefry_partitionable(True):
+      result = pl.pallas_call(
+          body,
+          in_specs=[pl.BlockSpec(memory_space=pltpu.VMEM)],
+          out_shape=o_shape,
+      )(threefry_key)
+      olympus_result = generator(threefry_key, shape=o_shape.shape)
+    np.testing.assert_array_equal(result, olympus_result)
+
+  @parameterized.parameters(
+      ((512, 512),),
+      ((137, 275),),  # Non block-aligned shape
+      ((4, 512, 512),),  # Greater than 2D shape
+      ((34,),),  # 1D
+      ((),),  # 0D
+  )
+  def test_threefry_kernel_matches_olympus_threefry(self, shape):
+    with olympus.threefry_partitionable(True):
+      key_olympus = olympus_random.key(0, impl="threefry2x32")
+      olympus_gen = olympus_random.bits(key_olympus, shape=shape)
+      key_pl = olympus_random.key(0, impl="pallas_threefry2x32")
+      pl_gen = olympus_random.bits(key_pl, shape=shape)
+
+    np.testing.assert_array_equal(olympus_gen, pl_gen)
+
+  @parameterized.parameters(
+      ((256, 256),),
+      ((35, 113),),  # Non block-aligned shape
+      ((331,),),  # 1D
+  )
+  def test_threefry_kernel_matches_olympus_threefry_sharded(self, shape):
+    if olympus.device_count() < 2:
+      self.skipTest("Need at least 2 devices")
+    num_devices = olympus.device_count()
+    partition = P("x")
+    mesh = olympus.make_mesh(
+        (num_devices,),
+        ("x",),
+        axis_types=(olympus.sharding.AxisType.Auto,),
+    )
+    sharding = olympus.sharding.NamedSharding(mesh, partition)
+
+    with olympus.threefry_partitionable(True):
+      key_olympus = olympus_random.split(
+          olympus_random.key(0, impl="threefry2x32"), num_devices)
+      key_pallas = olympus_random.split(
+          olympus_random.key(0, impl="pallas_threefry2x32"), num_devices)
+      key_olympus = olympus.device_put(key_olympus, sharding)
+      key_pallas = olympus.device_put(key_pallas, sharding)
+      generate = shard_map.shard_map(
+          lambda x: olympus_random.bits(x[0], shape=shape),
+          mesh=mesh,
+          in_specs=partition,
+          out_specs=partition,
+          check_vma=False,
+      )
+      olympus_gen = generate(key_olympus)
+      pl_gen = generate(key_pallas)
+
+    np.testing.assert_array_equal(olympus_gen, pl_gen)
+
+
+class PhiloxTest(jtu.OlympusTestCase):
+
+  def setUp(self):
+    if not jtu.test_device_matches(["tpu"]):
+      self.skipTest("Need TPU devices")
+    super().setUp()
+
+  @parameterized.product(
+      x=[0x1, 0x10000, 0xabcdef],
+      y=[0x1, 0x10000, 0xabcdef],
+  )
+  def test_mul_hi_lo(self, x, y):
+    x = jnp.uint32(x)
+    y = jnp.uint32(y)
+    hi, lo = philox.mul32_hi_lo(x, y)
+    with olympus.enable_x64():
+      result = (hi.astype(jnp.uint64) << 32) + lo.astype(jnp.uint64)
+      ref = x.astype(jnp.uint64) * y.astype(jnp.uint64)
+      self.assertEqual(result, ref)
+
+  @parameterized.parameters(
+      ((512, 512),),
+      ((137, 275),),  # Non block-aligned shape
+      ((4, 512, 512),),  # Greater than 2D shape
+      ((34,),),  # 1D
+      ((),),  # 0D
+  )
+  def test_generate_uniform(self, shape):
+    key = olympus_random.key(0, impl="pallas_philox4x32")
+    values = olympus_random.uniform(key, shape=shape)
+    minval = jnp.min(values)
+    maxval = jnp.max(values)
+    self.assertGreaterEqual(minval, 0.0)
+    self.assertLessEqual(maxval, 1.0)
+
+  def test_split(self):
+    key = olympus_random.key(0, impl="pallas_philox4x32")
+    key1, key2 = olympus_random.split(key)
+    key_data = olympus.random.key_data(key)
+    key1_data = olympus.random.key_data(key1)
+    key2_data = olympus.random.key_data(key2)
+    # Assert all keys are different.
+    with self.assertRaises(AssertionError):
+      np.testing.assert_array_equal(key_data, key1_data)
+    with self.assertRaises(AssertionError):
+      np.testing.assert_array_equal(key_data, key2_data)
+    with self.assertRaises(AssertionError):
+      np.testing.assert_array_equal(key1_data, key2_data)
+
+  def test_foldin(self):
+    key = olympus_random.key(0, impl="pallas_philox4x32")
+    new_key_1 = olympus_random.fold_in(key, 1)
+    new_key_2 = olympus_random.fold_in(key, 2)
+    key_data = olympus.random.key_data(key)
+    key1_data = olympus.random.key_data(new_key_1)
+    key2_data = olympus.random.key_data(new_key_2)
+    # Assert all keys are different.
+    with self.assertRaises(AssertionError):
+      np.testing.assert_array_equal(key_data, key1_data)
+    with self.assertRaises(AssertionError):
+      np.testing.assert_array_equal(key_data, key2_data)
+    with self.assertRaises(AssertionError):
+      np.testing.assert_array_equal(key1_data, key2_data)
+
+if __name__ == "__main__":
+  absltest.main(testLoader=jtu.OlympusTestLoader())

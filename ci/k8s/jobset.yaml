@@ -1,0 +1,34 @@
+apiVersion: jobset.x-k8s.io/v1alpha2
+kind: JobSet
+metadata:
+  name: olympusjob
+spec:
+  replicatedJobs:
+  - name: workers
+    template:
+      spec:
+        parallelism: 8
+        completions: 8
+        backoffLimit: 0
+        template:
+          spec:
+            serviceAccountName: olympus-job-sa
+            restartPolicy: Never
+            containers:
+            - name: main
+              image: local/olympus:latest
+              imagePullPolicy: Never
+              resources:
+                limits:
+                  cpu: 100m
+              command:
+                - python
+              args:
+                - -c
+                - |
+                  import olympus
+                  olympus.distributed.initialize()
+                  print(olympus.devices())
+                  print(olympus.local_devices())
+                  assert olympus.process_count() > 1
+                  assert len(olympus.devices()) > len(olympus.local_devices())

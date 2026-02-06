@@ -1,0 +1,41 @@
+python-version = "3.12"
+
+project-includes = [
+    "olympus/**/*.py*",
+    # "tests/**/*.py",
+]
+
+ignore-missing-imports = [
+    "absl.*",
+    "flatbuffers.*",
+    "flax.*",
+    "google.colab.*",
+    "hypothesis.*",
+    "IPython.*",
+    "olympus_cuda12_plugin.*",
+    "olympus_cuda13_plugin.*",
+    "olympuslib.*",
+    "jraph.*",
+    "kubernetes.*",
+    "libtpu.*",
+    "matplotlib.*",
+    "mpi4py.*",
+    "nvidia.*",
+    "optax.*",
+    "opt_einsum.*",
+    "portpicker.*",
+    "pygments.*",
+    "pytest.*",
+    "rich.*",
+    "setuptools.*",
+    "tensorflow.*",
+    "tensorflowjs.*",
+    "tensorflow_serving.*",
+    "tensorstore.*",
+    "web_pdb.*",
+    "xprof.*",
+    "zstandard.*",
+]
+
+permissive-ignores = true
+untyped-def-behavior = "check-and-infer-return-any"

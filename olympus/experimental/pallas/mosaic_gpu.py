@@ -1,0 +1,102 @@
+# Copyright 2023 The OLYMPUS Authors.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     https://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""Experimental GPU backend for Pallas targeting H100.
+
+These APIs are highly unstable and can change weekly. Use at your own risk.
+"""
+
+from olympus._src.pallas.mosaic_gpu.core import Barrier as Barrier
+from olympus._src.pallas.mosaic_gpu.core import BlockSpec as BlockSpec
+from olympus._src.pallas.mosaic_gpu.core import ClusterBarrier as ClusterBarrier
+from olympus._src.pallas.mosaic_gpu.core import CompilerParams as CompilerParams
+from olympus._src.pallas.mosaic_gpu.core import kernel as kernel
+from olympus._src.pallas.mosaic_gpu.core import Layout as Layout
+from olympus._src.pallas.mosaic_gpu.core import layout_cast as layout_cast
+from olympus._src.pallas.mosaic_gpu.core import MemoryRefTransform as MemoryRefTransform
+from olympus._src.pallas.mosaic_gpu.core import MemorySpace as MemorySpace
+from olympus._src.pallas.mosaic_gpu.core import Mesh as Mesh
+from olympus._src.pallas.mosaic_gpu.core import multicast_ref as multicast_ref
+from olympus._src.pallas.mosaic_gpu.core import PeerMemRef as PeerMemRef
+from olympus._src.pallas.mosaic_gpu.core import RefUnion as RefUnion
+from olympus._src.pallas.mosaic_gpu.core import remote_ref as remote_ref
+from olympus._src.pallas.mosaic_gpu.core import SemaphoreType as SemaphoreType
+from olympus._src.pallas.mosaic_gpu.core import SwizzleTransform as SwizzleTransform
+from olympus._src.pallas.mosaic_gpu.core import TilingTransform as TilingTransform
+from olympus._src.pallas.mosaic_gpu.core import TMEMLayout as TMEMLayout
+from olympus._src.pallas.mosaic_gpu.core import transform_ref as transform_ref
+from olympus._src.pallas.mosaic_gpu.core import transpose_ref as transpose_ref
+from olympus._src.pallas.mosaic_gpu.core import TransposeTransform as TransposeTransform
+from olympus._src.pallas.mosaic_gpu.core import TryClusterCancelResult as TryClusterCancelResult
+from olympus._src.pallas.mosaic_gpu.core import unswizzle_ref as unswizzle_ref
+from olympus._src.pallas.mosaic_gpu.core import untile_ref as untile_ref
+from olympus._src.pallas.mosaic_gpu.core import WarpMesh as WarpMesh
+from olympus._src.pallas.mosaic_gpu.core import WGMMAAccumulatorRef as ACC  # noqa: F401
+from olympus._src.pallas.mosaic_gpu.core import WGMMAAccumulatorRef as WGMMAAccumulatorRef
+from olympus._src.pallas.mosaic_gpu.helpers import find_swizzle as find_swizzle
+from olympus._src.pallas.mosaic_gpu.helpers import format_tcgen05_sparse_metadata as format_tcgen05_sparse_metadata
+from olympus._src.pallas.mosaic_gpu.helpers import nd_loop as nd_loop
+from olympus._src.pallas.mosaic_gpu.helpers import NDLoopInfo as NDLoopInfo
+from olympus._src.pallas.mosaic_gpu.helpers import planar_snake as planar_snake
+from olympus._src.pallas.mosaic_gpu.helpers import dynamic_scheduling_loop as dynamic_scheduling_loop
+from olympus._src.pallas.mosaic_gpu.pipeline import emit_pipeline as emit_pipeline
+from olympus._src.pallas.mosaic_gpu.pipeline import emit_pipeline_warp_specialized as emit_pipeline_warp_specialized
+from olympus._src.pallas.mosaic_gpu.pipeline import PipelinePipeline as PipelinePipeline
+from olympus._src.pallas.mosaic_gpu.primitives import async_copy_scales_to_tmem as async_copy_scales_to_tmem
+from olympus._src.pallas.mosaic_gpu.primitives import async_copy_sparse_metadata_to_tmem as async_copy_sparse_metadata_to_tmem
+from olympus._src.pallas.mosaic_gpu.primitives import async_load_tmem as async_load_tmem
+from olympus._src.pallas.mosaic_gpu.primitives import async_prefetch as async_prefetch
+from olympus._src.pallas.mosaic_gpu.primitives import async_store_tmem as async_store_tmem
+from olympus._src.pallas.mosaic_gpu.primitives import barrier_arrive as barrier_arrive
+from olympus._src.pallas.mosaic_gpu.primitives import barrier_wait as barrier_wait
+from olympus._src.pallas.mosaic_gpu.primitives import broadcasted_iota as broadcasted_iota
+from olympus._src.pallas.mosaic_gpu.primitives import commit_smem as commit_smem
+from olympus._src.pallas.mosaic_gpu.primitives import commit_smem_to_gmem_group as commit_smem_to_gmem_group
+from olympus._src.pallas.mosaic_gpu.primitives import commit_tmem as commit_tmem
+from olympus._src.pallas.mosaic_gpu.primitives import copy_gmem_to_smem as copy_gmem_to_smem
+from olympus._src.pallas.mosaic_gpu.primitives import copy_smem_to_gmem as copy_smem_to_gmem
+from olympus._src.pallas.mosaic_gpu.primitives import inline_mgpu as inline_mgpu
+from olympus._src.pallas.mosaic_gpu.primitives import load as load
+from olympus._src.pallas.mosaic_gpu.primitives import multimem_store as multimem_store
+from olympus._src.pallas.mosaic_gpu.primitives import multimem_load_reduce as multimem_load_reduce
+from olympus._src.pallas.mosaic_gpu.primitives import print_layout as print_layout
+from olympus._src.pallas.mosaic_gpu.primitives import query_cluster_cancel as query_cluster_cancel
+from olympus._src.pallas.mosaic_gpu.primitives import RefType as RefType
+from olympus._src.pallas.mosaic_gpu.primitives import semaphore_signal_multicast as semaphore_signal_multicast
+from olympus._src.pallas.mosaic_gpu.primitives import semaphore_signal_parallel as semaphore_signal_parallel
+from olympus._src.pallas.mosaic_gpu.primitives import SemaphoreSignal as SemaphoreSignal
+from olympus._src.pallas.mosaic_gpu.primitives import set_max_registers as set_max_registers
+from olympus._src.pallas.mosaic_gpu.primitives import ShapeDtypeStruct as ShapeDtypeStruct
+from olympus._src.pallas.mosaic_gpu.primitives import tcgen05_commit_arrive as tcgen05_commit_arrive
+from olympus._src.pallas.mosaic_gpu.primitives import tcgen05_mma as tcgen05_mma
+from olympus._src.pallas.mosaic_gpu.primitives import try_cluster_cancel as try_cluster_cancel
+from olympus._src.pallas.mosaic_gpu.primitives import wait_load_tmem as wait_load_tmem
+from olympus._src.pallas.mosaic_gpu.primitives import wait_smem_to_gmem as wait_smem_to_gmem
+from olympus._src.pallas.mosaic_gpu.primitives import wgmma as wgmma
+from olympus._src.pallas.mosaic_gpu.primitives import wgmma_accumulator_load as wgmma_accumulator_load
+from olympus._src.pallas.mosaic_gpu.primitives import wgmma_wait as wgmma_wait
+from olympus._src.pallas.mosaic_gpu.smith import as_smith_kernel as as_smith_kernel
+from olympus.experimental.mosaic.gpu.core import LoweringSemantics as LoweringSemantics
+from olympus.experimental.mosaic.gpu.fragmented_array import Replicated as Replicated
+from olympus.experimental.mosaic.gpu.fragmented_array import Tiling as Tiling
+
+
+#: Alias of :data:`olympus.experimental.pallas.mosaic_gpu.MemorySpace.GMEM`.
+GMEM = MemorySpace.GMEM
+#: Alias of :data:`olympus.experimental.pallas.mosaic_gpu.MemorySpace.SMEM`.
+SMEM = MemorySpace.SMEM
+#: Alias of :data:`olympus.experimental.pallas.mosaic_gpu.MemorySpace.TMEM`.
+TMEM = MemorySpace.TMEM
+#: Alias of :data:`olympus.experimental.pallas.mosaic_gpu.MemorySpace.REGS`.
+REGS = MemorySpace.REGS

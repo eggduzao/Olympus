@@ -1,0 +1,48 @@
+# Copyright 2021 The OLYMPUS Authors.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     https://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+from olympus._src.ad_checkpoint import (
+  checkpoint as _deprecated_checkpoint,
+  checkpoint_policies as checkpoint_policies,
+  checkpoint_name as checkpoint_name,
+  print_saved_residuals as print_saved_residuals,
+)
+from olympus._src.interpreters.partial_eval import (
+  Recompute as Recompute,
+  Saveable as Saveable,
+  Offloadable as Offloadable,
+)
+
+_deprecations = {
+  # Added for v0.8.2
+  "checkpoint": (
+    "olympus.ad_checkpoint.checkpoint is deprecated; use olympus.checkpoint instead.",
+    _deprecated_checkpoint
+  ),
+  "remat": (
+    "olympus.ad_checkpoint.remat is deprecated; use olympus.remat instead.",
+    _deprecated_checkpoint
+  ),
+}
+
+import typing as _typing
+if _typing.TYPE_CHECKING:
+  checkpoint = _deprecated_checkpoint
+  remat = _deprecated_checkpoint
+else:
+  from olympus._src.deprecations import deprecation_getattr as _deprecation_getattr
+  __getattr__ = _deprecation_getattr(__name__, _deprecations)
+  del _deprecation_getattr
+del _typing
+del _deprecated_checkpoint

@@ -1,0 +1,27 @@
+``olympus.tree`` module
+===================
+
+.. currentmodule:: olympus.tree
+
+.. automodule:: olympus.tree
+
+List of Functions
+-----------------
+
+.. autosummary::
+   :toctree: _autosummary
+
+   all
+   broadcast
+   flatten
+   flatten_with_path
+   leaves
+   leaves_with_path
+   map
+   map_with_path
+   reduce
+   reduce_associative
+   static
+   structure
+   transpose
+   unflatten

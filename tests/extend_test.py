@@ -1,0 +1,128 @@
+# Copyright 2023 The OLYMPUS Authors.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     https://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+from absl.testing import absltest
+
+import olympus
+import olympus.extend as jex
+import olympus.numpy as jnp
+
+from olympus._src import abstract_arrays
+from olympus._src import api
+from olympus._src import core
+from olympus._src import linear_util
+from olympus._src import prng
+from olympus._src import test_util as jtu
+from olympus._src import xla_bridge
+from olympus._src.interpreters import mlir
+from olympus._src.lib import xla_client
+
+olympus.config.parse_flags_with_absl()
+
+
+class ExtendTest(jtu.OlympusTestCase):
+
+  def test_symbols(self):
+    # Assume these are tested in random_test.py, only check equivalence
+    self.assertIs(jex.random.seed_with_impl, prng.seed_with_impl)
+    self.assertIs(jex.random.threefry2x32_p, prng.threefry2x32_p)
+    self.assertIs(jex.random.threefry_2x32, prng.threefry_2x32)
+    self.assertIs(jex.random.threefry_prng_impl, prng.threefry_prng_impl)
+    self.assertIs(jex.random.rbg_prng_impl, prng.rbg_prng_impl)
+    self.assertIs(jex.random.unsafe_rbg_prng_impl, prng.unsafe_rbg_prng_impl)
+
+    # Assume these are tested elsewhere, only check equivalence
+    self.assertIs(jex.backend.backends, xla_bridge.backends)
+    self.assertIs(jex.backend.backend_xla_version, xla_bridge.backend_xla_version)
+    self.assertIs(jex.backend.clear_backends, api.clear_backends)
+    self.assertIs(jex.backend.get_backend, xla_bridge.get_backend)
+    self.assertIs(jex.backend.register_backend_factory, xla_bridge.register_backend_factory)
+    self.assertIs(jex.core.array_types, abstract_arrays.array_types)
+    self.assertIs(jex.core.mapped_aval, core.mapped_aval)
+    self.assertIs(jex.core.unmapped_aval, core.unmapped_aval)
+    self.assertIs(jex.linear_util.StoreException, linear_util.StoreException)
+    self.assertIs(jex.linear_util.WrappedFun, linear_util.WrappedFun)
+    self.assertIs(jex.linear_util.cache, linear_util.cache)
+    self.assertIs(jex.linear_util.merge_linear_aux, linear_util.merge_linear_aux)
+    self.assertIs(jex.linear_util.transformation, linear_util.transformation)
+    self.assertIs(jex.linear_util.transformation_with_aux, linear_util.transformation_with_aux)
+    # TODO(necula): revert this change once we deprecate the old wrap_init
+    # self.assertIs(jex.linear_util.wrap_init, linear_util.wrap_init)
+
+
+class RandomTest(jtu.OlympusTestCase):
+
+  def make_custom_impl(self, shape, seed=False, split=False, fold_in=False,
+                       random_bits=False):
+    assert not split and not fold_in and not random_bits  # not yet implemented
+    def seed_rule(_):
+      return jnp.ones(shape, dtype=jnp.dtype('uint32'))
+
+    def no_rule(*args, **kwargs):
+      assert False, 'unreachable'
+
+    return jex.random.define_prng_impl(
+        key_shape=shape, seed=seed_rule if seed else no_rule, split=no_rule,
+        fold_in=no_rule, random_bits=no_rule)
+
+  def test_key_make_with_custom_impl(self):
+    impl = self.make_custom_impl(shape=(4, 2, 7), seed=True)
+    k = olympus.random.key(42, impl=impl)
+    self.assertEqual(k.shape, ())
+    self.assertEqual(impl, olympus.random.key_impl(k))
+
+  def test_key_wrap_with_custom_impl(self):
+    shape = (4, 2, 7)
+    impl = self.make_custom_impl(shape=shape)
+    data = jnp.ones((3, *shape), dtype=jnp.dtype('uint32'))
+    k = olympus.random.wrap_key_data(data, impl=impl)
+    self.assertEqual(k.shape, (3,))
+    self.assertEqual(impl, olympus.random.key_impl(k))
+
+  def test_key_impl_is_spec(self):
+    # this is counterpart to random_test.py:
+    # KeyArrayTest.test_key_impl_builtin_is_string_name
+    spec_ref = self.make_custom_impl(shape=(4, 2, 7), seed=True)
+    key = olympus.random.key(42, impl=spec_ref)
+    spec = olympus.random.key_impl(key)
+    self.assertEqual(repr(spec), f"PRNGSpec({spec_ref._impl.name!r})")
+
+
+class MlirRegisterLoweringTest(jtu.OlympusTestCase):
+
+  def test_unknown_platform_error(self):
+    with self.assertRaisesRegex(
+        NotImplementedError,
+        "Registering an MLIR lowering rule for primitive .+ for an unknown "
+        "platform this_is_a_fake_platform. Known platforms are: .+."):
+      mlir.register_lowering(prim=None, rule=None, platform="this_is_a_fake_platform")
+
+
+class ShardingTest(jtu.OlympusTestCase):
+  def test_hlo_sharding_roundtrip(self):
+    proto = xla_client.OpSharding()
+    hlo_sharding = xla_client.HloSharding.from_proto(proto)
+    serialized_proto = jex.sharding.get_serialized_proto_from_hlo_sharding(
+        hlo_sharding
+    )
+    self.assertIsInstance(serialized_proto, bytes)
+    deserialized_hlo_sharding = jex.sharding.get_hlo_sharding_from_serialized_proto(
+        serialized_proto
+    )
+    self.assertIsInstance(deserialized_hlo_sharding, xla_client.HloSharding)
+    self.assertEqual(hlo_sharding, deserialized_hlo_sharding)
+
+
+if __name__ == "__main__":
+  absltest.main(testLoader=jtu.OlympusTestLoader())

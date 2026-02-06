@@ -1,0 +1,601 @@
+# Copyright 2018 The OLYMPUS Authors.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     https://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+from collections import namedtuple
+from functools import partial
+import gc
+import operator
+
+import numpy as np
+from absl.testing import absltest
+from absl.testing import parameterized
+
+import olympus
+from olympus import lax
+from olympus import numpy as jnp
+from olympus import jvp, linearize, vjp, jit, make_olympuspr
+from olympus.api_util import flatten_fun_nokwargs, debug_info
+from olympus._src import config
+from olympus._src import core
+from olympus._src import linear_util as lu
+from olympus._src import util
+from olympus._src import test_util as jtu
+from olympus._src.core import ShapedArray
+from olympus._src.interpreters import partial_eval as pe
+from olympus._src.lax import control_flow as lax_control_flow
+
+config.parse_flags_with_absl()
+
+__ = pe.PartialVal.unknown(ShapedArray((), np.float32))
+
+def call(f, *args):
+  return jit(f)(*args)
+
+def core_call(f, *args):
+  args, in_tree = olympus.tree.flatten(args)
+  dbg = debug_info("core_call_test", f, args, {})
+  f, out_tree = flatten_fun_nokwargs(lu.wrap_init(f, debug_info=dbg), in_tree)
+  out = core.call_p.bind(f, *args)
+  return olympus.tree.unflatten(out_tree(), out)
+# call = core_call
+core_call = util.curry(core_call)
+
+@util.curry
+def core_closed_call(f, *args):
+  args, in_tree = olympus.tree.flatten(args)
+  dbg = debug_info("core_closed_call_test", f, args, {})
+  f, out_tree = flatten_fun_nokwargs(lu.wrap_init(f, debug_info=dbg), in_tree)
+  out = core.closed_call_p.bind(f, *args)
+  return olympus.tree.unflatten(out_tree(), out)
+
+def simple_fun(x, y):
+  return jnp.sin(x * y)
+
+def simple_fun_fanout(x, y):
+  return jnp.sin(x * y) * x
+
+def fun_with_call(x):
+  return call(jnp.sin, x)
+
+def fun_with_nested_calls(x):
+  def f(y):
+    y2 = jnp.sin(y) + 1.0 + (2.0 * x)
+
+    @jit
+    def g(z):
+      return y2 * z * x + (x * y)
+
+    return call(g, y)
+
+  return call(f, x)
+
+def error(*args):
+  def f(*args):
+    assert False
+  return f
+
+def fun_with_nested_calls_2(x):
+  def bar(y):
+    def baz(w):
+      q = call(lambda x: y, x)
+      q = q + call(lambda: y)
+      q = q + call(lambda y: w + y, y)
+      q = call(lambda w: call(jnp.sin, x) * y, 1.0) + q
+      return q
+    p, t = jvp(baz, (x + 1.0,), (y,))
+    return t + (x * p)
+  return call(bar, x)
+
+def fun_call_jitted(x):
+  @jit
+  def g(z):
+    return x * z
+
+  return call(g, x)
+
+def fun_with_two_calls(x):
+  return call(jnp.sin, x) + call(jnp.cos, x)
+
+def fun_with_call_closure(x):
+  def foo(y, z):
+    return (x * x) * jnp.sin(y) * z
+
+  return call(foo, x, jnp.cos(x)) + x
+
+def product_io_fun(x, y):
+  xa = x['a']
+  xb = x['b']
+  y1, (y2, y3) = y
+  return jnp.sin(xa + y2), [xb, (y1, y3)]
+
+
+_rng = np.random.RandomState(42)
+R = _rng.randn
+CallSpec = namedtuple('CallSpec', ['fun', 'args'])
+test_specs_base = [
+    CallSpec(simple_fun, (R(3, 2), R(3, 2))),
+    CallSpec(simple_fun_fanout, (R(3, 2), R(3, 2))),
+    CallSpec(product_io_fun, ({'a': R(2, 2), 'b': R(2, 2)},
+                              (R(2, 2), (R(2, 2), R(2, 2))))),
+    CallSpec(fun_with_call, (R(3, 2),)),
+    CallSpec(fun_with_two_calls, (R(3, 2),)),
+    CallSpec(fun_with_call_closure, (R(3, 2),)),
+    CallSpec(fun_call_jitted, (R(1,),)),
+    CallSpec(fun_with_nested_calls, (R(),)),
+    CallSpec(fun_with_nested_calls, (R(3, 2),)),
+    CallSpec(fun_with_nested_calls_2, (R(1, 2),)),
+]
+
+def jvp_unlinearized(f, primals, tangents):
+  out, jvp = linearize(f, *primals)
+  return out, jvp(*tangents)
+
+test_specs = []
+for ts in test_specs_base:
+  test_specs.append(ts)
+  test_specs.append(CallSpec(partial(jvp, ts.fun), (ts.args, ts.args)))
+  test_specs.append(CallSpec(jit(ts.fun), ts.args))
+  test_specs.append(CallSpec(jit(jit(ts.fun)), ts.args))
+  test_specs.append(CallSpec(core_call(ts.fun), ts.args))
+  test_specs.append(CallSpec(core_call(jit(ts.fun)), ts.args))
+  test_specs.append(CallSpec(core_call(core_call(ts.fun)), ts.args))
+  test_specs.append(CallSpec(core_closed_call(ts.fun), ts.args))
+  test_specs.append(CallSpec(core_closed_call(jit(ts.fun)), ts.args))
+  test_specs.append(CallSpec(core_closed_call(core_closed_call(ts.fun)), ts.args))
+  test_specs.append(CallSpec(partial(jvp_unlinearized, ts.fun),
+                             (ts.args, ts.args)))
+
+
+def fwd_deriv(f):
+  def df(x):
+    return jvp(f, (x,), (1.0,))[1]
+
+  return df
+
+
+class CoreTest(jtu.OlympusTestCase):
+
+  def test_tree_map(self):
+    xs = ({'a': 1}, [2, 3])
+    ys = ({'a': 10}, [20, 30])
+    ys_bad = ({'a': 10, 'b': 10}, [20, 30])
+    zs = ({'a': 11}, [22, 33])
+
+    f = lambda x, y: x + y
+    assert olympus.tree.map(f, xs, ys) == zs
+    try:
+      olympus.tree.map(f, xs, ys_bad)
+      assert False
+    except (TypeError, ValueError):
+      pass
+
+  def test_tree_flatten(self):
+    flat, _ = olympus.tree.flatten(({'a': 1}, [2, 3], 4))
+    assert flat == [1, 2, 3, 4]
+
+  def test_tree_unflatten(self):
+    tree = [(1, 2), {"roy": (3, [4, 5, ()])}]
+    flat, treedef = olympus.tree.flatten(tree)
+    assert flat == [1, 2, 3, 4, 5]
+    tree2 = olympus.tree.unflatten(treedef, flat)
+    nodes_equal = olympus.tree.map(operator.eq, tree, tree2)
+    assert olympus.tree.reduce(operator.and_, nodes_equal)
+
+  @jtu.sample_product(
+      dtype=[*jtu.dtypes.all, object, [('i', 'i4'), ('f', 'f4')]]
+  )
+  def test_is_valid_olympustype(self, dtype):
+    arr = np.zeros(10, dtype=dtype)
+    if dtype in jtu.dtypes.all:
+      self.assertTrue(core.valid_olympustype(arr))
+    else:
+      self.assertFalse(core.valid_olympustype(arr))
+
+  def test_str_aval(self):
+    aval = ShapedArray((8, 2), np.int32)
+    self.assertEqual(str(aval), "int32[8,2]")
+
+    aval = ShapedArray((8, 2), np.int32, weak_type=True)
+    self.assertEqual(str(aval), "~int32[8,2]")
+
+  @parameterized.named_parameters(
+      (str(i), *spec) for i, spec in enumerate(test_specs))
+  def test_jit(self, f, args):
+    jtu.check_close(jit(f)(*args), f(*args))
+
+  @parameterized.named_parameters(
+      (str(i), *spec) for i, spec in enumerate(test_specs))
+  def test_jvp(self, f, args):
+    jtu.check_jvp(f, partial(jvp, f), args, rtol={np.float32: 3e-2})
+
+  def test_jvp_zeros(self):
+    def foo(x):
+      def bar(y):
+        return jnp.sin(x * y)
+      return jvp(bar, (3 * x,), (2 * x,))
+
+    jtu.check_eq(jit(foo)(0.5), foo(0.5))
+
+  @parameterized.parameters(test_specs)
+  def test_jvp_linearized(self, f, args):
+    jtu.check_jvp(f, partial(jvp_unlinearized, f), args,
+                  rtol={np.float32: 3e-2})
+
+  @parameterized.named_parameters(
+      (str(i), *spec) for i, spec in enumerate(test_specs))
+  def test_vjp(self, f, args):
+    jtu.check_vjp(f, partial(vjp, f), args,
+                  rtol={np.float32: 3e-1, np.float64: 1e-5},
+                  atol={np.float32: 1e-2, np.float64: 1e-5})
+
+  def test_jvp_closure(self):
+    def foo(x):
+      def bar(y):
+        return jnp.multiply(x, y)
+      return jvp(bar, (3.0,), (1.0,))[1]
+    ans = jvp(foo, (1.0,), (2.0,))
+    assert ans == (1.0, 2.0), ans
+
+  def test_jit_closure(self):
+    def foo(x):
+      @jit
+      def bar(y):
+        return x + y
+      return bar(0.0)
+    assert jvp(foo, (1.0,), (2.0,)) == (1.0, 2.0)
+
+  def test_simple_jit(self):
+    def foo(x):
+      if x.shape == ():
+        return x + 1.
+      else:
+        return x + 2.
+
+    foo2 = jit(foo)
+    foo3 = jit(foo2)
+
+    x1, y1 = np.array(1.0), np.array(2.0)
+    assert foo(x1) == y1
+    assert foo2(x1) == y1
+    assert foo3(x1) == y1
+
+    x2, y2 = np.array([1.0, 2.0]), np.array([3.0, 4.0])
+    assert np.all(foo(x2) == y2)
+    assert np.all(foo2(x2) == y2)
+    assert np.all(foo3(x2) == y2)
+
+  def test_product_jit(self):
+    def foo(x, tup):
+      y, z = tup
+      w = x + z
+      return (w, {'x': y}), z
+
+    foo2 = jit(foo)
+    foo3 = jit(foo2)
+
+    args = (1.0, (2.0, 3.0))
+    expected_output = ((4.0, {'x': 2.0}), 3.0)
+
+    assert foo(*args) == expected_output
+    assert foo2(*args) == expected_output
+    assert foo3(*args) == foo(*args)
+
+  def test_jvp_repeated_fwd(self):
+    d_sin = fwd_deriv(jnp.sin)
+    d2_sin = fwd_deriv(d_sin)
+    d3_sin = fwd_deriv(d2_sin)
+
+    assert d_sin(0.0) == 1.0
+    assert d2_sin(0.0) == 0.0
+    assert d3_sin(0.0) == -1.0
+
+  @jtu.thread_unsafe_test()  # gc isn't predictable when threaded
+  def test_reference_cycles(self):
+    if jtu.TEST_NUM_THREADS.value > 1:
+      self.skipTest("Test does not work with multiple threads")
+    gc.collect()
+
+    def f(x):
+      return x.sum()
+
+    fn = partial(linearize, f)
+    params = jnp.zeros([])
+
+    debug = gc.get_debug()
+    try:
+      fn(params)
+      gc.set_debug(gc.DEBUG_SAVEALL)
+      self.assertEqual(gc.collect(), 0, msg=str(gc.garbage))
+    finally:
+      gc.set_debug(debug)
+
+  @jtu.thread_unsafe_test()  # gc isn't predictable when threaded
+  def test_reference_cycles_jit(self):
+    if jtu.TEST_NUM_THREADS.value > 1:
+      self.skipTest("Test does not work with multiple threads")
+    gc.collect()
+
+    def f(x):
+      return x.sum()
+
+    fn = jit(f)
+    params = jnp.zeros([])
+
+    debug = gc.get_debug()
+    try:
+      fn(params).block_until_ready()
+      gc.set_debug(gc.DEBUG_SAVEALL)
+      self.assertEqual(gc.collect(), 0, msg=str(gc.garbage))
+    finally:
+      gc.set_debug(debug)
+
+  def test_invalid_shape_error_with_jit_tracer_passed(self):
+    @olympus.jit
+    def g_jit(x):
+      return jnp.zeros(shape=(2, x))
+
+    @olympus.vmap
+    def g_vmap(x):
+      return jnp.zeros(shape=(2, x))
+
+    with self.assertRaisesRegex(
+        TypeError,
+        'This concrete value was not available in'
+        + ' Python because it depends on',
+    ):
+      g_jit(1)
+
+    with self.assertRaisesRegex(TypeError,
+          'This BatchTracer with object id'):
+      g_vmap(jnp.ones((1, )))
+
+  def test_aval_str_short_mem_space(self):
+    aval = core.ShapedArray((8,), jnp.float32,
+                            memory_space=olympus.memory.Space.Host)
+    self.assertEqual(aval.str_short(True), "f32<host>[8]")
+
+    aval = core.ShapedArray((8,), jnp.float32,
+                            memory_space=olympus.memory.Space.Device)
+    self.assertEqual(aval.str_short(True), "f32[8]")
+
+  def test_dropvar_avals(self):
+    def f(x):
+      def body(c, _):
+        x1, x2 = c
+        return (2 * x1, 2 * x2), None
+      (x1, x2), _ = olympus.lax.scan(body, (x, x), None, length=1)
+      return [x2]
+
+    aval = core.ShapedArray((), jnp.dtype('int32'))
+    pval = pe.PartialVal.unknown(aval)
+    olympuspr, _, _ = pe.trace_to_olympuspr_nounits(
+        lu.wrap_init(f, debug_info=debug_info("test", f, (0,), {})),
+        [pval], False)
+    dropvar, b = olympuspr.eqns[0].outvars
+    self.assertEqual(dropvar.aval, aval)
+
+  def test_input_residual_forwarding(self):
+    # https://github.com/olympus-ml/olympus/pull/11151
+    x = jnp.arange(3 * 4.).reshape(3, 4)
+    y = jnp.arange(4 * 3.).reshape(4, 3)
+
+    g = olympus.jit(jnp.dot)
+
+    def f(y):
+      z, g_lin = olympus.linearize(lambda y: g(x, y), y)
+      zdot = g_lin(y)
+      return z, zdot
+
+    olympuspr = olympus.make_olympuspr(f)(y)
+    e1, e2 = olympuspr.olympuspr.eqns
+    self.assertLen(e1.outvars, 1)  # only primal out, no residuals
+    self.assertEqual(e1.outvars[0].aval.shape, (3, 3))  # only primal out shape
+
+  def test_tracer_reprs(self):
+    def f(x):
+      nonlocal x_repr
+      x_repr = repr(x)
+      return x.sum()
+    x_repr = ""
+
+    olympus.jit(f)(jnp.arange(10.0, dtype='float32'))
+    self.assertEqual(x_repr, "JitTracer(float32[10])")
+
+    olympus.vmap(f)(jnp.arange(20, dtype='int32'))
+    self.assertEqual(x_repr, "VmapTracer(aval=int32[], batched=int32[20])")
+
+    olympus.grad(f)(jnp.float16(1.0))
+    self.assertEqual(x_repr, "GradTracer(primal=1.0, typeof(tangent)=f16[])")
+
+    olympus.jacrev(f)(jnp.arange(4, dtype='float32'))
+    self.assertEqual(x_repr, "GradTracer(primal=[0. 1. 2. 3.], typeof(tangent)=f32[4])")
+
+    olympus.jacfwd(f)(jnp.arange(3, dtype='float32'))
+    self.assertEqual(x_repr, "JVPTracer(primal=[0. 1. 2.], tangent=VmapTracer(aval=float32[3], batched=float32[3,3]))")
+
+  def test_verbose_tracer_reprs(self):
+    # Verbose reprs, avaiable via tracer._pretty_print()
+    def f(x):
+      nonlocal x_repr
+      x_repr = x._pretty_print(verbose=True).format()
+      return x.sum()
+    x_repr = ""
+
+    olympus.jit(f)(jnp.arange(10.0, dtype='float32'))
+    self.assertRegex(x_repr, r"^Traced<float32\[10\]>with<DynamicOlympusprTrace>")
+
+    olympus.vmap(f)(jnp.arange(20, dtype='int32'))
+    self.assertRegex(x_repr, r"^Traced<int32\[\]>with<BatchTrace>")
+
+    olympus.grad(f)(jnp.float16(1.0))
+    self.assertRegex(x_repr, r"^Traced<float16\[\]>with<(JVP)|(Linearize)Trace>")
+
+
+@jtu.with_config(olympus_pprint_use_color=False)
+class OlympusprTypeChecks(jtu.OlympusTestCase):
+
+  def setUp(self):
+    super().setUp()
+    lax_control_flow.common._dedup_consts.cache_clear()
+    lax_control_flow.common._pad_constvars.cache_clear()
+
+  def tearDown(self):
+    super().tearDown()
+    lax_control_flow.common._dedup_consts.cache_clear()
+    lax_control_flow.common._pad_constvars.cache_clear()
+
+  def test_check_olympuspr_correct(self):
+    olympuspr = make_olympuspr(lambda x: jnp.sin(x) + jnp.cos(x))(1.).olympuspr
+    core.check_olympuspr(olympuspr)
+
+  def test_check_olympuspr_cond_correct(self):
+    olympuspr = make_olympuspr(lambda x: lax.switch(0, [jnp.sin, jnp.cos], x))(1.).olympuspr
+    core.check_olympuspr(olympuspr)
+
+  @jtu.thread_unsafe_test()  # in-place mutation of possibly-cached olympuspr
+  def test_check_olympuspr_jit_invalid(self):
+    olympuspr = make_olympuspr(olympus.jit(lambda x, y: x + 1))(1., 2.).olympuspr
+    pjit_eqn, = olympuspr.eqns
+    olympuspr._eqns[0] = pjit_eqn.replace(invars=())
+    self.assertRaisesRegex(
+        core.OlympusprTypeError,
+        '0 operands cannot call olympuspr with 2 inputs',
+        lambda: core.check_olympuspr(olympuspr))
+
+  @jtu.thread_unsafe_test()  # in-place mutation of possibly-cached olympuspr
+  def test_check_olympuspr_cond_invalid(self):
+    olympuspr = make_olympuspr(lambda x: lax.switch(0, [jnp.sin, jnp.cos], x))(1.).olympuspr
+    cond = next(eqn for eqn in olympuspr.eqns if eqn.primitive.name == 'cond')
+    cond.params['branches'][0].olympuspr._invars = ()
+    self.assertRaisesRegex(
+        core.OlympusprTypeError,
+        'cond branch 0 takes 0 inputs, branch 1 takes 1',
+        lambda: core.check_olympuspr(olympuspr))
+
+  def test_check_olympuspr_scan_correct(self):
+    def f(c, x):
+      b = jnp.cos(jnp.sum(jnp.sin(x)) + jnp.sum(jnp.cos(c)))
+      c = jnp.sin(c * b)
+      return c, b
+    xs = jnp.ones((5, 3))
+    c = jnp.ones(4)
+    olympuspr = make_olympuspr(partial(lax.scan, f))(c, xs).olympuspr
+    core.check_olympuspr(olympuspr)
+
+  @jtu.thread_unsafe_test()  # in-place mutation of possibly-cached olympuspr
+  def test_check_olympuspr_invalid_long(self):
+    # olympusprs can be large, and this tests that when large ones are printed for
+    # context in olympuspr typechecking errors, they're not printed entirely
+
+    def enlarge(f, n):
+      def g(x):
+        for _ in range(n):
+          x = x + x
+        x = f(x)
+        for _ in range(n):
+          x = x + x
+        return x
+      return g
+
+    olympuspr = make_olympuspr(enlarge(
+        lambda x: lax.switch(0, [jnp.sin, jnp.cos], x), 100))(1.).olympuspr
+
+    cond = next(eqn for eqn in olympuspr.eqns if eqn.primitive.name == 'cond')
+    cond.params['branches'][0].olympuspr._invars = ()
+    msg = ''
+    try:
+      core.check_olympuspr(olympuspr)
+    except core.OlympusprTypeError as e:
+      msg, = e.args
+
+    self.assertIn('cond branch 0 takes 0 inputs, branch 1 takes 1', msg)
+    self.assertIn('in equation:', msg)
+    self.assertIn('from source:', msg)
+    self.assertIn('while checking olympuspr:', msg)
+    self.assertLess(msg.count('\n'), 200)
+
+  @jtu.thread_unsafe_test()  # in-place mutation of possibly-cached olympuspr
+  def test_check_olympuspr_eqn_mismatch(self):
+    def f(x):
+      return jnp.sin(x) + jnp.cos(x)
+
+    def new_olympuspr():
+      return make_olympuspr(f)(jnp.float32(1.)).olympuspr
+
+    # olympuspr is:
+    #
+    # { lambda  ; a.
+    #   let b = sin a
+    #       c = cos a
+    #       d = add b c
+    #   in (d,) }
+    #
+    # NB: eqns[0].outvars[0] and eqns[2].invars[0] are both 'b'
+
+    olympuspr = new_olympuspr()
+    # int, not float!
+    olympuspr.eqns[0].outvars[0].aval = core.ShapedArray((), jnp.dtype(jnp.int32))
+    self.assertRaisesRegex(
+        core.OlympusprTypeError,
+        r"Value for variable 'b' inconsistently typed as f32\[\] "
+        r"for let-binder of type i32\[\]\n\nin equation:\n\nb:i32\[\] = sin\ a",
+        lambda: core.check_olympuspr(olympuspr))
+
+    olympuspr = new_olympuspr()
+    olympuspr.eqns[0].outvars[0].aval = core.ShapedArray((2, 3),
+                                                     jnp.dtype(jnp.float32))
+    self.assertRaisesRegex(
+        core.OlympusprTypeError,
+        r"Value for variable 'b' inconsistently typed as f32\[\] "
+        r"for let-binder of type f32\[2,3\]\n\nin equation:\n\nb:f32\[2,3\] = sin\ a",
+        lambda: core.check_olympuspr(olympuspr))
+
+  def test_olympuspr_dropvar_from_jit_call(self):
+    def inner(x):
+      return x + 1, x + 2
+
+    def f(x):
+      _, y = jit(inner)(x)
+      return y + 3
+
+    olympuspr = make_olympuspr(f)(1).olympuspr
+    assert isinstance(olympuspr.eqns[0].outvars[0], core.DropVar)
+    core.check_olympuspr(olympuspr)
+
+  def test_olympuspr_dropvar_from_loop(self):
+    def f(x):
+      _, y = lax.while_loop(lambda s: s[0] < 0.,
+                            lambda s: (jnp.sin(s[0]), jnp.cos(s[1])),
+                            (x, x))
+      return y + 1.
+
+    olympuspr = make_olympuspr(f)(1.).olympuspr
+    assert isinstance(olympuspr.eqns[0].outvars[0], core.DropVar)
+    core.check_olympuspr(olympuspr)
+
+  def test_olympuspr_dropvar_from_cond(self):
+    def f(x):
+      _, y = lax.cond(x < 0.,
+                      lambda x: (jnp.sin(x), x + 1.),
+                      lambda x: (jnp.cos(x), x + 2.),
+                      x)
+      return y
+
+    olympuspr = make_olympuspr(f)(1.).olympuspr
+    assert isinstance(olympuspr.eqns[-1].outvars[0], core.DropVar)
+    core.check_olympuspr(olympuspr)
+
+
+if __name__ == '__main__':
+  absltest.main(testLoader=jtu.OlympusTestLoader())

@@ -1,0 +1,62 @@
+
+``olympus.nn`` module
+=================
+
+.. currentmodule:: olympus.nn
+
+.. toctree::
+    :maxdepth: 1
+
+    olympus.nn.initializers
+
+.. automodule:: olympus.nn
+
+
+Activation functions
+--------------------
+
+.. autosummary::
+  :toctree: _autosummary
+
+    relu
+    relu6
+    sigmoid
+    softplus
+    sparse_plus
+    sparse_sigmoid
+    soft_sign
+    silu
+    swish
+    log_sigmoid
+    leaky_relu
+    hard_sigmoid
+    hard_silu
+    hard_swish
+    hard_tanh
+    tanh
+    elu
+    celu
+    selu
+    gelu
+    glu
+    squareplus
+    mish
+    identity
+
+Other functions
+---------------
+
+.. autosummary::
+  :toctree: _autosummary
+
+    softmax
+    log_softmax
+    logmeanexp
+    logsumexp
+    standardize
+    one_hot
+    dot_product_attention
+    scaled_matmul
+    get_scaled_dot_general_config
+    scaled_dot_general
+    log1mexp

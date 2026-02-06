@@ -1,0 +1,1247 @@
+# Copyright 2019 The OLYMPUS Authors.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     https://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+
+import dataclasses
+import enum
+import functools
+from functools import partial
+import itertools
+import operator
+import types
+
+from absl.testing import absltest
+from absl.testing import parameterized
+
+import numpy as np
+
+import olympus
+from olympus import numpy as jnp
+from olympus._src import earray
+from olympus._src import config
+from olympus._src import dtypes
+from olympus._src import literals
+from olympus._src import test_util as jtu
+from olympus._src.lax import lax as lax_internal
+
+config.parse_flags_with_absl()
+
+bool_dtypes = [np.dtype('bool')]
+
+np_signed_dtypes = [np.dtype('int8'), np.dtype('int16'), np.dtype('int32'),
+                    np.dtype('int64')]
+signed_dtypes = list(np_signed_dtypes)
+
+np_unsigned_dtypes = [np.dtype('uint8'), np.dtype('uint16'), np.dtype('uint32'),
+                     np.dtype('uint64')]
+unsigned_dtypes = list(np_unsigned_dtypes)
+
+intn_dtypes = [np.dtype('int2'), np.dtype('uint2'), np.dtype('int4'), np.dtype('uint4')]
+signed_dtypes += [np.dtype('int2'), np.dtype('int4')]
+unsigned_dtypes += [np.dtype('uint2'), np.dtype('uint4')]
+
+np_float_dtypes = [np.dtype('float16'), np.dtype('float32'), np.dtype('float64')]
+
+float_dtypes = [np.dtype(dtypes.bfloat16)] + np_float_dtypes
+custom_float_dtypes = [np.dtype(dtypes.bfloat16)]
+
+fp8_dtypes = [np.dtype(dtypes.float8_e4m3b11fnuz), np.dtype(dtypes.float8_e4m3fn),
+              np.dtype(dtypes.float8_e4m3fnuz), np.dtype(dtypes.float8_e5m2),
+              np.dtype(dtypes.float8_e5m2fnuz), np.dtype(dtypes.float8_e3m4),
+              np.dtype(dtypes.float8_e4m3), np.dtype(dtypes.float8_e8m0fnu)]
+float_dtypes += fp8_dtypes
+custom_float_dtypes += fp8_dtypes
+
+fp4_dtypes = []
+if dtypes.float4_e2m1fn is not None:
+  fp4_dtypes += [np.dtype(dtypes.float4_e2m1fn)]
+float_dtypes += fp4_dtypes
+custom_float_dtypes += fp4_dtypes
+
+x64_dtypes = [np.dtype('int64'), np.dtype('uint64'), np.dtype('float64'),
+              np.dtype('complex128')]
+
+complex_dtypes = [np.dtype('complex64'), np.dtype('complex128')]
+
+
+all_dtypes = (bool_dtypes + signed_dtypes + unsigned_dtypes + float_dtypes +
+              complex_dtypes)
+
+scalar_types = [jnp.bool_, jnp.int4, jnp.int8, jnp.int16, jnp.int32, jnp.int64,
+                jnp.uint4, jnp.uint8, jnp.uint16, jnp.uint32, jnp.uint64,
+                jnp.bfloat16, jnp.float16, jnp.float32, jnp.float64,
+                jnp.complex64, jnp.complex128]
+
+dtype_kinds = {
+  'bool': bool_dtypes,
+  'signed integer': signed_dtypes,
+  'unsigned integer': unsigned_dtypes,
+  'integral': signed_dtypes + unsigned_dtypes,
+  'real floating': float_dtypes,
+  'complex floating': complex_dtypes,
+  'numeric': signed_dtypes + unsigned_dtypes + float_dtypes + complex_dtypes,
+}
+
+python_scalar_types = [bool, int, float, complex]
+
+_EXPECTED_CANONICALIZE_X64 = {value: value for value in scalar_types}
+
+_EXPECTED_CANONICALIZE_X32 = {value: value for value in scalar_types}
+_EXPECTED_CANONICALIZE_X32[np.int64] = np.int32
+_EXPECTED_CANONICALIZE_X32[np.uint64] = np.uint32
+_EXPECTED_CANONICALIZE_X32[np.float64] = np.float32
+_EXPECTED_CANONICALIZE_X32[np.complex128] = np.complex64
+_EXPECTED_CANONICALIZE_X32[np.longlong] = np.int32
+
+UINT_DTYPES = {
+  4: jnp.uint4,
+  8: np.uint8,
+  16: np.uint16,
+  32: np.uint32,
+  64: np.uint64,
+}
+
+def identity(x):
+  """A named identity function for use in tests"""
+  return x
+
+TypedInt = literals.TypedInt
+TypedFloat = literals.TypedFloat
+TypedComplex = literals.TypedComplex
+TypedNdArray = literals.TypedNdArray
+
+class DtypesTest(jtu.OlympusTestCase):
+
+  def test_canonicalize_type(self):
+    expected = {
+        True: _EXPECTED_CANONICALIZE_X64,
+        False: _EXPECTED_CANONICALIZE_X32,
+    }
+    for in_dtype, expected_dtype in expected[config.enable_x64.value].items():
+      self.assertEqual(dtypes.canonicalize_dtype(in_dtype), expected_dtype)
+
+  def test_canonicalize_value_preserves_literal_dtypes(self):
+    self.assertEqual(np.dtype(np.int32), dtypes.canonicalize_value(
+        TypedInt(6, dtype=np.dtype(np.int32))).dtype)
+    self.assertEqual(np.dtype(np.int64), dtypes.canonicalize_value(
+        TypedInt(6, dtype=np.dtype(np.int64))).dtype)
+    self.assertEqual(np.dtype(np.float32), dtypes.canonicalize_value(
+        TypedFloat(6, dtype=np.dtype(np.float32))).dtype)
+    self.assertEqual(np.dtype(np.float64), dtypes.canonicalize_value(
+        TypedFloat(6, dtype=np.dtype(np.float64))).dtype)
+    self.assertEqual(np.dtype(np.complex64), dtypes.canonicalize_value(
+        TypedComplex(6, dtype=np.dtype(np.complex64))).dtype)
+    self.assertEqual(np.dtype(np.complex128), dtypes.canonicalize_value(
+        TypedComplex(6, dtype=np.dtype(np.complex128))).dtype)
+    self.assertEqual(
+        np.dtype(np.int32),
+        dtypes.canonicalize_value(
+            TypedNdArray(np.array([6], dtype=np.dtype(np.int32)),
+                         weak_type=False)
+        ).dtype,
+    )
+    self.assertEqual(
+        np.dtype(np.int64),
+        dtypes.canonicalize_value(
+            TypedNdArray(np.array([6], dtype=np.dtype(np.int64)),
+                         weak_type=False)
+        ).dtype,
+    )
+
+  @parameterized.named_parameters(
+    {"testcase_name": f"_type={type_.__name__}", "type_": type_}
+    for type_ in python_scalar_types)
+  def testDefaultTypes(self, type_):
+    expected_dtype = dtypes.canonicalize_dtype(
+        dtypes.python_scalar_types_to_dtypes[type_]
+    )
+    for f in [jnp.array, olympus.jit(jnp.array), olympus.jit(lambda x: x)]:
+      y = f(type_(0))
+      self.assertTrue(isinstance(y, olympus.Array), msg=(f, y))
+      self.assertEqual(y.dtype, expected_dtype, msg=(f, y))
+
+  def testUnsupportedType(self):
+    with self.assertRaisesRegex(TypeError, "nonsense.* not understood"):
+      dtypes.canonicalize_dtype("nonsense")
+
+  @parameterized.named_parameters(
+    {"testcase_name": f"_{swap=}_{jit=}",
+     "swap": swap, "jit": jit}
+    for swap in [False, True] for jit in [False, True])
+  @jtu.ignore_warning(category=UserWarning,
+                      message="Explicitly requested dtype.*")
+  @olympus.numpy_dtype_promotion('standard')
+  def testBinaryPromotion(self, swap, jit):
+    if config.explicit_x64_dtypes.value == config.ExplicitX64Mode.ERROR:
+      self.skipTest("Test uses explicit x64 dtypes")
+    dfloat = dtypes.canonicalize_dtype(float)
+    testcases = [
+      (jnp.array(1.), 0., dfloat),
+      (jnp.array(1.), jnp.array(0.), dfloat),
+      (jnp.array(1.), jnp.array(0., dtype=jnp.float16), jnp.float16),
+      (jnp.array(1.), jnp.array(0., dtype=jnp.float32), jnp.float32),
+      (jnp.array(1.), jnp.array(0., dtype=jnp.float64), jnp.float64),
+      (jnp.array(1., dtype=jnp.float16), 0., jnp.float16),
+      (jnp.array(1., dtype=jnp.float32), 0., jnp.float32),
+      (jnp.array(1., dtype=jnp.float64), 0., jnp.float64),
+      (jnp.array(1., dtype=jnp.float16), jnp.array(0., dtype=jnp.float16), jnp.float16),
+      (jnp.array(1., dtype=jnp.float16), jnp.array(0., dtype=jnp.float32), jnp.float32),
+      (jnp.array(1., dtype=jnp.float16), jnp.array(0., dtype=jnp.float64), jnp.float64),
+      (jnp.array(1., dtype=jnp.float32), jnp.array(0., dtype=jnp.float32), jnp.float32),
+      (jnp.array(1., dtype=jnp.float32), jnp.array(0., dtype=jnp.float64), jnp.float64),
+      (jnp.array(1., dtype=jnp.float64), jnp.array(0., dtype=jnp.float64), jnp.float64),
+      (jnp.array([1.]), 0., dfloat),
+      (jnp.array([1.]), jnp.array(0.), dfloat),
+      (jnp.array([1.]), jnp.array(0., dtype=jnp.float16), dfloat),
+      (jnp.array([1.]), jnp.array(0., dtype=jnp.float32), dfloat),
+      (jnp.array([1.]), jnp.array(0., dtype=jnp.float64), jnp.float64),
+      (jnp.array([1.], dtype=jnp.float32), jnp.array(0., dtype=jnp.float16), jnp.float32),
+      (jnp.array([1.], dtype=jnp.float16), jnp.array(0., dtype=jnp.float32), jnp.float32),
+      (jnp.array([1.], dtype=jnp.float16), 0., jnp.float16),
+    ]
+    op = olympus.jit(operator.add) if jit else operator.add
+    for x, y, dtype in testcases:
+      x, y = (y, x) if swap else (x, y)
+      z = op(x, y)
+      self.assertTrue(isinstance(z, olympus.Array), msg=(x, y, z))
+      if config.explicit_x64_dtypes.value == config.ExplicitX64Mode.ALLOW:
+        self.assertEqual(z.dtype, dtype, msg=(x, y, z))
+      else:
+        self.assertEqual(z.dtype, dtypes.canonicalize_dtype(dtype), msg=(x, y, z))
+
+  @olympus.numpy_dtype_promotion('strict')
+  def testPromoteDtypesStrict(self):
+    msg = ("Input dtypes .* have no available implicit dtype promotion "
+           "path when olympus_numpy_dtype_promotion=strict")
+
+    assertTypePromotionError = functools.partial(
+      self.assertRaisesRegex, dtypes.TypePromotionError, msg,
+      dtypes.promote_types)
+
+    # Check that strong types have diagonal promotion table:
+    for t1 in all_dtypes:
+      for t2 in all_dtypes:
+        if t1 == t2:
+          self.assertEqual(t1, dtypes.promote_types(t1, t2))
+        else:
+          assertTypePromotionError(t1, t2)
+
+    # Promotion between weak types matches numpy promotion
+    for t1 in [int, float, complex]:
+      for t2 in [int, float, complex]:
+        py_result = type(t1(0) + t2(0))
+        # np.dtype(int) is int32 on Windows and int64 on Linux/Mac.
+        py_result_dtype = (np.dtype(np.int64) if py_result is int
+                           else np.dtype(py_result))
+        lattice_dtype, lattice_weak_type = dtypes.lattice_result_type(t1, t2)
+        self.assertTrue(lattice_weak_type)
+        self.assertEqual(lattice_dtype,
+                         dtypes.canonicalize_dtype(py_result_dtype))
+
+    # Check that weak promotion only works if strong value is not cast:
+    for t1 in bool_dtypes:
+      assertTypePromotionError(t1, int)
+      assertTypePromotionError(t1, float)
+      assertTypePromotionError(t1, complex)
+    for t1 in signed_dtypes + unsigned_dtypes:
+      self.assertEqual(dtypes.promote_types(t1, int), t1)
+      assertTypePromotionError(t1, float)
+      assertTypePromotionError(t1, complex)
+    for t1 in float_dtypes:
+      self.assertEqual(dtypes.promote_types(t1, int), t1)
+      self.assertEqual(dtypes.promote_types(t1, float), t1)
+      assertTypePromotionError(t1, complex)
+    for t1 in complex_dtypes:
+      self.assertEqual(dtypes.promote_types(t1, int), t1)
+      self.assertEqual(dtypes.promote_types(t1, float), t1)
+      self.assertEqual(dtypes.promote_types(t1, complex), t1)
+
+  @olympus.numpy_dtype_promotion('standard')
+  def testPromoteDtypesStandard(self):
+    assertTypePromotionError = functools.partial(
+        self.assertRaisesRegex,
+        dtypes.TypePromotionError,
+        'Input dtypes .* have no available implicit dtype promotion path.',
+        dtypes.promote_types,
+    )
+
+    small_fp_dtypes = set(fp8_dtypes + fp4_dtypes)
+    implicit_int_dtypes = set(signed_dtypes + unsigned_dtypes) - set(intn_dtypes)
+
+    for t1 in all_dtypes:
+      self.assertEqual(t1, dtypes.promote_types(t1, t1))
+      self.assertEqual(t1, dtypes.promote_types(t1, np.bool_))
+      # TODO(zhangqiaorjc): Consider more dtype promotion rules for fp8.
+      if t1 in small_fp_dtypes or t1 in intn_dtypes:
+        assertTypePromotionError(t1, np.complex128)
+      else:
+        self.assertEqual(
+            np.dtype(np.complex128), dtypes.promote_types(t1, np.complex128)
+        )
+
+      for t2 in all_dtypes:
+        # TODO(zhangqiaorjc): Consider more dtype promotion rules for fp8.
+        if (
+            (t1 != t2)
+            and (t1 != np.bool_)
+            and (t2 != np.bool_)
+            and (
+                t1 in intn_dtypes or
+                t2 in intn_dtypes or
+                (t1 in small_fp_dtypes and t2 not in implicit_int_dtypes) or
+                (t2 in small_fp_dtypes and t1 not in implicit_int_dtypes)
+            )
+        ):
+          assertTypePromotionError(t1, t2)
+          assertTypePromotionError(t2, t1)
+        else:
+          self.assertEqual(
+              dtypes.promote_types(t1, t2), dtypes.promote_types(t2, t1)
+          )
+
+    self.assertEqual(np.dtype(np.float32),
+                     dtypes.promote_types(np.float16, dtypes.bfloat16))
+
+    # Promotions of exact types against inexact types always prefer the
+    # inexact types.
+    for t in float_dtypes + complex_dtypes:
+      for i in bool_dtypes + signed_dtypes + unsigned_dtypes:
+        if i in intn_dtypes:
+          assertTypePromotionError(t, i)
+        else:
+          self.assertEqual(t, dtypes.promote_types(t, i))
+
+    # Promotions between exact types, or between inexact types, match NumPy.
+    for groups in [bool_dtypes + np_signed_dtypes + np_unsigned_dtypes,
+                   np_float_dtypes + complex_dtypes]:
+      for t1, t2 in itertools.combinations(groups, 2):
+        expected = np.promote_types(t1, t2)
+        if (
+            not config.enable_x64.value
+            and np.issubdtype(t1, np.signedinteger)
+            and t1 != np.int64
+            and t2 == np.uint32
+        ):
+          expected = np.dtype(np.int32)
+        self.assertEqual(expected, dtypes.promote_types(t1, t2))
+
+    # Promotion between weak types matches numpy promotion
+    for t1 in [int, float, complex]:
+      for t2 in [int, float, complex]:
+        py_result = type(t1(0) + t2(0))
+        # np.dtype(int) is int32 on Windows and int64 on Linux/Mac.
+        py_result_dtype = (np.dtype(np.int64) if py_result is int
+                           else np.dtype(py_result))
+        lattice_dtype, lattice_weak_type = dtypes.lattice_result_type(t1, t2)
+        self.assertTrue(lattice_weak_type)
+        self.assertEqual(lattice_dtype,
+                         dtypes.canonicalize_dtype(py_result_dtype))
+
+  @parameterized.parameters([jnp.bool_, jnp.int32, jnp.bfloat16, jnp.float32, jnp.complex64])
+  def testScalarInstantiation(self, scalar_type):
+    a = scalar_type(1)
+    self.assertEqual(a.dtype, jnp.dtype(scalar_type))
+    self.assertIsInstance(a, olympus.Array)
+    self.assertEqual(0, jnp.ndim(a))
+    self.assertIsInstance(np.dtype(scalar_type).type(1), scalar_type)
+
+  def testIsSubdtype(self):
+    for t in scalar_types:
+      self.assertTrue(dtypes.issubdtype(t, t))
+      self.assertTrue(dtypes.issubdtype(np.dtype(t).type, t))
+      self.assertTrue(dtypes.issubdtype(t, np.dtype(t).type))
+      self.assertTrue(dtypes.issubdtype(t, np.dtype(t)))
+      if t in [jnp.int4, jnp.uint4, jnp.bfloat16]:
+        # These dtype have no equivalent in NumPy.
+        continue
+      for category in [np.generic, jnp.inexact, jnp.integer, jnp.signedinteger,
+                       jnp.unsignedinteger, jnp.floating, jnp.complexfloating]:
+        self.assertEqual(dtypes.issubdtype(t, category),
+                         np.issubdtype(np.dtype(t).type, category))
+        self.assertEqual(dtypes.issubdtype(t, category),
+                         np.issubdtype(np.dtype(t).type, category))
+
+  @parameterized.product(dtype=custom_float_dtypes)
+  def testIsSubdtypeCustomFloats(self, dtype):
+    for dt in [dtype, np.dtype(dtype), str(np.dtype(dtype))]:
+      self.assertTrue(dtypes.issubdtype(dt, dt))
+      self.assertTrue(dtypes.issubdtype(dt, np.dtype(dtype)))
+      self.assertTrue(dtypes.issubdtype(dt, str(np.dtype(dtype))))
+      self.assertTrue(dtypes.issubdtype(dt, np.floating))
+      self.assertTrue(dtypes.issubdtype(dt, np.inexact))
+      self.assertTrue(dtypes.issubdtype(dt, np.number))
+      self.assertTrue(dtypes.issubdtype(dt, np.generic))
+      self.assertFalse(dtypes.issubdtype(dt, object))
+      self.assertFalse(dtypes.issubdtype(dt, np.float64))
+      self.assertFalse(dtypes.issubdtype(np.generic, dt))
+
+  @parameterized.product(dtype=intn_dtypes)
+  def testIsSubdtypeIntN(self, dtype):
+    if dtype in ('int2', 'int4'):
+      int_category = np.signedinteger
+    elif dtype in ('uint2', 'uint4'):
+      int_category = np.unsignedinteger
+    else:
+      raise ValueError(f'Unexpected dtype: {dtype}')
+    for dt in [dtype, np.dtype(dtype), str(np.dtype(dtype))]:
+      self.assertTrue(dtypes.issubdtype(dt, dt))
+      self.assertTrue(dtypes.issubdtype(dt, np.dtype(dtype)))
+      self.assertTrue(dtypes.issubdtype(dt, str(np.dtype(dtype))))
+      self.assertTrue(dtypes.issubdtype(dt, int_category))
+      self.assertTrue(dtypes.issubdtype(dt, np.integer))
+      self.assertTrue(dtypes.issubdtype(dt, np.number))
+      self.assertTrue(dtypes.issubdtype(dt, np.generic))
+      self.assertFalse(dtypes.issubdtype(dt, object))
+      self.assertFalse(dtypes.issubdtype(dt, np.int64))
+      self.assertFalse(dtypes.issubdtype(np.generic, dt))
+
+  @jtu.sample_product(
+      dtype=all_dtypes,
+      kind=(*dtype_kinds, *all_dtypes)
+  )
+  def testIsDtype(self, dtype, kind):
+    if isinstance(kind, np.dtype):
+      expected = (dtype == kind)
+    else:
+      expected = (dtype in dtype_kinds[kind])
+    self.assertEqual(expected, dtypes.isdtype(dtype, kind))
+
+  def testArrayCasts(self):
+    for t in [jnp.bool_, jnp.int32, jnp.bfloat16, jnp.float32, jnp.complex64]:
+      a = np.array([1, 2.5, -3.7])
+      self.assertEqual(a.astype(t).dtype, jnp.dtype(t))
+      self.assertEqual(jnp.array(a).astype(t).dtype, jnp.dtype(t))
+
+  def testEnumPromotion(self):
+    class AnEnum(enum.IntEnum):
+      A = 42
+      B = 101
+    np.testing.assert_equal(np.array(42), np.array(AnEnum.A))
+    np.testing.assert_equal(jnp.array(42), jnp.array(AnEnum.A))
+    np.testing.assert_equal(np.int32(101), np.int32(AnEnum.B))
+    np.testing.assert_equal(jnp.int32(101), jnp.int32(AnEnum.B))
+
+  def testScalarCastInsideJitWorks(self):
+    # jnp.int32(tracer) should work.
+    self.assertEqual(jnp.int32(101),
+                     olympus.jit(lambda x: jnp.int32(x))(jnp.float32(101.4)))
+
+  def testDtypeFromScalarType(self):
+    self.assertEqual(dtypes.dtype(bool), np.dtype(np.bool_))
+    if config.enable_x64.value:
+      self.assertEqual(dtypes.dtype(int), np.dtype(np.int64))
+      self.assertEqual(dtypes.dtype(float), np.dtype(np.float64))
+      self.assertEqual(dtypes.dtype(complex), np.dtype(np.complex128))
+    else:
+      self.assertEqual(dtypes.dtype(int), np.dtype(np.int32))
+      self.assertEqual(dtypes.dtype(float), np.dtype(np.float32))
+      self.assertEqual(dtypes.dtype(complex), np.dtype(np.complex64))
+
+  def testDtypeFromScalarValue(self):
+    self.assertEqual(dtypes.dtype(bool(0)), np.dtype(np.bool_))
+    if config.enable_x64.value:
+      self.assertEqual(dtypes.dtype(int(0)), np.dtype(np.int64))
+      self.assertEqual(dtypes.dtype(float(0)), np.dtype(np.float64))
+      self.assertEqual(dtypes.dtype(complex(0)), np.dtype(np.complex128))
+    else:
+      self.assertEqual(dtypes.dtype(int(0)), np.dtype(np.int32))
+      self.assertEqual(dtypes.dtype(float(0)), np.dtype(np.float32))
+      self.assertEqual(dtypes.dtype(complex(0)), np.dtype(np.complex64))
+
+  def testDtypeFromLiteralValue(self):
+    self.assertEqual(dtypes.dtype(TypedInt(0, np.dtype(np.int64))), np.dtype(np.int64))
+    self.assertEqual(dtypes.dtype(TypedFloat(0, np.dtype(np.float64))), np.dtype(np.float64))
+    self.assertEqual(dtypes.dtype(TypedComplex(0, np.dtype(np.complex128))), np.dtype(np.complex128))
+    self.assertEqual(dtypes.dtype(TypedInt(0, np.dtype(np.int32))), np.dtype(np.int32))
+    self.assertEqual(dtypes.dtype(TypedFloat(0, np.dtype(np.float32))), np.dtype(np.float32))
+    self.assertEqual(dtypes.dtype(TypedComplex(0, np.dtype(np.complex64))), np.dtype(np.complex64))
+    self.assertEqual(dtypes.dtype(TypedNdArray(np.array([0], dtype=np.int32), weak_type=False)), np.dtype(np.int32))
+    self.assertEqual(dtypes.dtype(TypedNdArray(np.array([0], dtype=np.int64), weak_type=False)), np.dtype(np.int64))
+
+  @parameterized.parameters(all_dtypes)
+  def testDtypeFromValue(self, dtype):
+    self.assertEqual(dtypes.dtype(dtype.type(0)),
+                     dtypes.canonicalize_dtype(dtype))
+
+  @parameterized.product(
+      dtype=all_dtypes,
+      explicit_x64_dtypes=tuple(config.ExplicitX64Mode.__members__.values()),
+  )
+  def testDtypeFromDtype(self, dtype, explicit_x64_dtypes):
+    with config.explicit_x64_dtypes(explicit_x64_dtypes):
+      if explicit_x64_dtypes == config.ExplicitX64Mode.ALLOW:
+        self.assertEqual(dtypes.dtype(dtype), dtype)
+      elif explicit_x64_dtypes == config.ExplicitX64Mode.WARN:
+        with jtu.ignore_warning(category=UserWarning,
+                                message="Explicitly requested dtype.*"):
+          self.assertEqual(dtypes.dtype(dtype), dtypes.canonicalize_dtype(dtype))
+      else:
+        if config.enable_x64.value or dtype not in x64_dtypes:
+          self.assertEqual(dtypes.dtype(dtype), dtypes.canonicalize_dtype(dtype))
+        else:
+          with self.assertRaisesRegex(ValueError, "Explicitly requested dtype"):
+            dtypes.dtype(dtype)
+
+  @parameterized.parameters(all_dtypes)
+  def testDtypeFromString(self, dtype):
+    if config.explicit_x64_dtypes.value != config.ExplicitX64Mode.ERROR and dtype not in x64_dtypes:
+      self.assertEqual(dtypes.dtype(str(dtype)), dtypes.canonicalize_dtype(dtype))
+
+  def testDtypeFromNone(self):
+    with self.assertRaisesRegex(ValueError, "Invalid argument to dtype"):
+      dtypes.dtype(None)
+
+  def testDefaultDtypes(self):
+    self.assertEqual(dtypes.bool_, np.bool_)
+    self.assertEqual(dtypes.int_, np.int64)
+    self.assertEqual(dtypes.uint, np.uint64)
+    self.assertEqual(dtypes.float_, np.float64)
+    self.assertEqual(dtypes.complex_, np.complex128)
+
+  def test_check_dtype_non_hashable(self):
+    # regression test for issue with checking non-hashable custom dtype
+    class MyDtype:
+      __hash__ = None
+      dtype = np.dtype('float32')
+    dtypes.check_and_canonicalize_user_dtype(MyDtype())
+
+  def test_check_dtype_array(self):
+    x = jnp.arange(4)
+    msg = "Passing an array as a dtype argument is no longer supported"
+    with self.assertRaisesRegex(ValueError, msg):
+      dtypes.check_and_canonicalize_user_dtype(x)
+    with self.assertRaisesRegex(ValueError, msg):
+      def f(x):
+        dtypes.check_and_canonicalize_user_dtype(x)
+      olympus.jit(f)(x)
+
+  @parameterized.parameters(
+      (jnp.int2, 2),
+      (jnp.int4, 4),
+      (jnp.int8, 8),
+      (jnp.int16, 16),
+      (jnp.int32, 32),
+      *[(fp4_dtype, 4) for fp4_dtype in fp4_dtypes],
+      *[(fp8_dtype, 8) for fp8_dtype in fp8_dtypes],
+      (jnp.float16, 16),
+      (jnp.float32, 32),
+      (jnp.float64, 64),
+  )
+  def test_itemsize_bits(self, dtype, expected_bitwidth):
+    self.assertEqual(dtypes.itemsize_bits(dtype), expected_bitwidth)
+
+  def test_itemsize_none_raises(self):
+    with self.assertRaisesRegex(ValueError, 'dtype cannot be None'):
+      dtypes.itemsize_bits(None)
+
+
+class ExtendedDTypeTest(jtu.OlympusTestCase):
+
+  def testIsSubdtypeExtended(self):
+    self.assertTrue(dtypes.issubdtype(dtypes.extended, dtypes.extended))
+    self.assertTrue(dtypes.issubdtype(dtypes.extended, np.generic))
+    self.assertFalse(dtypes.issubdtype(dtypes.extended, np.number))
+
+    self.assertTrue(jnp.issubdtype(dtypes.prng_key, dtypes.prng_key))
+    self.assertTrue(jnp.issubdtype(dtypes.prng_key, dtypes.extended))
+    self.assertTrue(jnp.issubdtype(dtypes.prng_key, np.generic))
+    self.assertFalse(dtypes.issubdtype(dtypes.prng_key, np.number))
+
+  def test_custom_tangent_dtype(self):
+    from olympus._src import core
+
+    class scale(dtypes.extended):
+      pass
+
+    class ScalesTyRules:
+      allow_conversion: bool = True
+
+      @staticmethod
+      def physical_element_aval(dtype) -> core.ShapedArray:
+        return core.ShapedArray((), dtype.float_dtype)
+
+      @staticmethod
+      def global_sharded_result_handler(aval, sharding, committed, is_from_xla):
+        raise NotImplementedError("convert back under the jit")
+
+      @staticmethod
+      def add(dt, x, y):
+        fromscale = partial(olympus.lax.convert_element_type, new_dtype=dt.float_dtype)
+        toscale = partial(olympus.lax.convert_element_type, new_dtype=dt)
+        return toscale(olympus.lax.max(fromscale(x), fromscale(y)))
+
+      @staticmethod
+      def zero(dt):
+        neginf = np.array(-np.inf if dtypes.supports_inf(dt.float_dtype)
+                          else dtypes.finfo(dt.float_dtype).min, dt.float_dtype)
+        return olympus.lax.convert_element_type(neginf, dt)
+
+    @dataclasses.dataclass(frozen=True)
+    class ScaleTy(dtypes.ExtendedDType):
+      float_dtype: dtypes.DType
+      name: str = 'scale'
+      _rules: type = ScalesTyRules
+      type: type = scale
+
+    @olympus.custom_vjp
+    def g(x):
+      return x
+    def g_fwd(x):
+      return x, None
+    def g_bwd(_, ct):
+      ct = olympus.lax.convert_element_type(ct, ScaleTy(dtypes.float8_e5m2))
+      return ct,
+    g.defvjp(g_fwd, g_bwd)
+
+    @olympus.custom_vjp
+    def convert(x):
+      return x
+    def convert_fwd(x):
+      return x, None
+    def convert_bwd(_, ct):
+      ct = olympus.lax.convert_element_type(ct, ct.dtype.float_dtype)
+      return ct,
+    convert.defvjp(convert_fwd, convert_bwd)
+
+    @olympus.jit
+    def f(x):
+      x = convert(x)
+      x = g(x) + g(x)
+      return x
+
+    x = jnp.array(3., dtypes.float8_e5m2)
+    out = olympus.grad(f)(x)
+    self.assertAllClose(out, 1., check_dtypes=False)
+    self.assertTrue(dtypes.issubdtype(ScaleTy(dtypes.float8_e5m2), scale))
+
+  def test_custom_tangent_dtype_with_scan(self):
+    from olympus._src import core
+
+    class ScalesTyRules:
+      # tell OLYMPUS how to lower this dtype to an HLO representation dtype
+      @staticmethod
+      def physical_element_aval(dtype) -> core.ShapedArray:
+        return core.ShapedArray((), dtype.float_dtype)
+
+      # allow conversions to and from the corresponding representation type
+      allow_conversion: bool = True
+
+      # define how autodiff should accumulate these values
+      @staticmethod
+      def add(dt, x, y):
+        fromscale = partial(olympus.lax.convert_element_type, new_dtype=dt.float_dtype)
+        toscale = partial(olympus.lax.convert_element_type, new_dtype=dt)
+        return toscale(olympus.lax.max(fromscale(x), fromscale(y)))
+
+      @staticmethod
+      def zero(dt):
+        neginf = np.array(-np.inf if dtypes.supports_inf(dt.float_dtype)
+                          else dtypes.finfo(dt.float_dtype).min, dt.float_dtype)
+        return olympus.lax.convert_element_type(neginf, dt)
+
+      @staticmethod
+      def tangent_dtype(dtype):
+        return dtype
+
+      # NOTE: by skipping some rules, this dtype can only be used underneath jit
+
+    # class to use as second argument to olympus.dtypes.issubdtype
+    class scale_dtype(dtypes.extended): pass
+
+    # parameterized datatype for use in e.g. olympus.lax.convert_element_type
+    @dataclasses.dataclass(frozen=True)
+    class scale_dtype(dtypes.ExtendedDType):
+      float_dtype: dtypes.DType
+      _rules: type = ScalesTyRules
+      type: type = scale_dtype
+
+      def __repr__(self) -> str:
+        nbits = dtypes.finfo(self.float_dtype).bits
+        return f'scale{nbits}'
+      name = property(__repr__)
+
+    f32 = jnp.dtype('float32')
+    sc32 = scale_dtype(f32)
+
+    def outer(x, scale_f32):
+      scale = olympus.lax.convert_element_type(scale_f32, sc32)
+      def body_fun(carry, _):
+        carry = inner(carry, scale)
+        return carry, None
+      x, _ = olympus.lax.scan(body_fun, x, None, length=3)
+      return x
+
+    @olympus.custom_vjp
+    def inner(carry, scale):
+      del scale  # only used under autodiff
+      return carry
+    def inner_fwd(carry, scale):
+      return inner(carry, scale), scale
+    def inner_bwd(prev_scale, grads):
+      # convert sc32->f32 so we can do math
+      prev_scale_f32 = olympus.lax.convert_element_type(prev_scale, f32)
+      new_scale_f32 = 1./2 * (prev_scale_f32 + jnp.max(grads))
+      # convert f32->sc32 so the autodiff system accumulates scales correctly
+      new_scale = olympus.lax.convert_element_type(new_scale_f32, sc32)
+      return grads, new_scale
+    inner.defvjp(inner_fwd, inner_bwd)
+
+    scale = jnp.float32(1.)
+    _, new_scale = olympus.jit(olympus.grad(outer, (0, 1)))(jnp.float32(3.14), scale)
+    self.assertAllClose(new_scale, jnp.float32(1.0))
+
+  @parameterized.parameters([True])  # TODO(mattjj): make jit=False work
+  def test_primal_tangent_dtype(self, jit):
+    dt = dtypes.primal_tangent_dtype(jnp.int8, jnp.bfloat16)
+
+    x = olympus.random.uniform(olympus.random.key(0), (3,), minval=0, maxval=10
+                           ).astype(jnp.int8)
+    g = olympus.random.uniform(olympus.random.key(0), (3,), minval=0, maxval=10
+                           ).astype(jnp.bfloat16)
+
+    @olympus.custom_gradient
+    def f(x):
+      def bwd(g):
+        return 2 * g,
+      return jnp.int8(x).astype(g.dtype) * 2 + 1, bwd
+
+    def h():
+      result, bwd = olympus.vjp(f, x.astype(dt))
+      bwd_result, = bwd(g)
+      return result, bwd_result
+
+    if jit:
+      h = olympus.jit(h)
+
+    result, bwd_result = h()
+    self.assertEqual(result.dtype, jnp.bfloat16)
+    self.assertEqual(bwd_result.dtype, jnp.bfloat16)
+    self.assertAllClose(bwd_result, 2 * g)
+    self.assertEqual(repr(dt), 'PrimalTangentDType{i8/bf16}')
+
+  @parameterized.parameters(itertools.product([(), (2,), (3, 4)], repeat=2))
+  def test_edtype_conversion(self, shape_prefix, shape_suffix):
+    class scalar(dtypes.extended): ...
+
+    @dataclasses.dataclass(frozen=True)
+    class DType(dtypes.ExtendedDType):
+      name = 'dt'
+      type = scalar
+      _rules = types.SimpleNamespace(
+          physical_element_aval=
+          lambda _: types.SimpleNamespace(shape=shape_suffix, dtype='int32'),
+          allow_conversion=True)
+    dtype = DType()
+
+    @olympus.jit
+    def f(x):
+      self.assertEqual(x.shape, shape_prefix + shape_suffix)
+      self.assertEqual(x.dtype, jnp.dtype('int32'))
+      x = olympus.lax.convert_element_type(x, dtype)
+      self.assertEqual(x.shape, shape_prefix)
+      self.assertEqual(x.dtype, dtype)
+      x = olympus.lax.convert_element_type(x, 'int32')
+      self.assertEqual(x.shape, shape_prefix + shape_suffix)
+      self.assertEqual(x.dtype, jnp.dtype('int32'))
+    f(jnp.zeros(shape_prefix + shape_suffix, dtype='int32'))
+
+  def test_edtype_conversion_errors(self):
+    class scalar(dtypes.extended): ...
+
+    @dataclasses.dataclass(frozen=True)
+    class DType(dtypes.ExtendedDType):
+      name = 'dt'
+      type = scalar
+      _rules = types.SimpleNamespace(
+          physical_element_aval=
+          lambda _: types.SimpleNamespace(shape=(3,), dtype='int32'),
+          allow_conversion=True)
+    dtype = DType()
+
+    class scalar2(dtypes.extended): ...
+
+    @dataclasses.dataclass(frozen=True)
+    class DType2(dtypes.ExtendedDType):
+      name = 'dt2'
+      type = scalar2
+      _rules = types.SimpleNamespace(
+          physical_element_aval=
+          lambda _: types.SimpleNamespace(shape=(3,), dtype='int32'),
+          allow_conversion=True)
+    dtype2 = DType2()
+
+    @olympus.jit
+    def f(x):
+      y = olympus.lax.convert_element_type(x, dtype)
+      with self.assertRaisesRegex(ValueError, "cannot directly"):
+        olympus.lax.convert_element_type(y, dtype2)
+      with self.assertRaisesRegex(ValueError, "can only convert"):
+        olympus.lax.convert_element_type(x.astype('float32'), dtype)
+      with self.assertRaisesRegex(ValueError, "can only convert"):
+        olympus.lax.convert_element_type(x[:, :2], dtype)
+      with self.assertRaisesRegex(ValueError, "can only convert"):
+        olympus.lax.convert_element_type(x[:, 0], dtype)
+      with self.assertRaisesRegex(ValueError, "can only convert"):
+        olympus.lax.convert_element_type(y, 'float32')
+    f(jnp.zeros((5, 3), dtype='int32'))
+
+  def test_edtype_conversion_autodiff(self):
+
+    class scalar(dtypes.extended): ...
+
+    @dataclasses.dataclass(frozen=True)
+    class DType(dtypes.ExtendedDType):
+      name = 'dt'
+      type = scalar
+      _rules = types.SimpleNamespace(
+          physical_element_aval=
+          lambda _: types.SimpleNamespace(shape=(), dtype='float32'),
+          tangent_dtype=lambda dtype: jnp.dtype('bfloat16'),
+          allow_conversion=True)
+    dtype = DType()
+
+    @olympus.jit
+    @olympus.grad
+    def f(x):
+      x = olympus.lax.convert_element_type(x, dtype)
+
+      @olympus.custom_jvp
+      def g(x): return x
+      @g.defjvp
+      def g_jvp(primals, tangents):
+        (x,), (x_dot,) = primals, tangents
+        self.assertEqual(x.shape, (5,))
+        self.assertEqual(x.dtype, dtype)
+        self.assertEqual(x_dot.shape, (5,))
+        self.assertEqual(x_dot.dtype, jnp.dtype('bfloat16'))
+        return x, x_dot
+      x = g(x)
+
+      x = olympus.lax.convert_element_type(x, 'float32')
+
+      @olympus.custom_jvp
+      def h(x): return x
+      @h.defjvp
+      def h_jvp(primals, tangents):
+        (x,), (x_dot,) = primals, tangents
+        self.assertEqual(x.shape, (5,))
+        self.assertEqual(x.dtype, jnp.dtype('float32'))
+        self.assertEqual(x_dot.shape, (5,))
+        self.assertEqual(x_dot.dtype, jnp.dtype('float32'))
+        return x, x_dot
+      x = h(x)
+
+      return 0.
+
+    f(jnp.zeros(5, dtype='float32'))  # test assertions in the function
+
+
+class EArrayTest(jtu.OlympusTestCase):
+
+  @parameterized.parameters([True, False])
+  def test_extended_dtypes_at_rest(self, jit):
+    # Test a trivial isomorphic-to-float32 extended dtype working with EArray
+    from olympus._src import core
+    from olympus._src.interpreters import pxla
+
+    class foo(dtypes.extended): pass
+
+    class FooTyRules:
+      allow_conversion: bool = True
+
+      @staticmethod
+      def physical_element_aval(foo_dtype):
+        return core.ShapedArray((), dtypes.dtype('float32'))
+
+      @staticmethod
+      def global_sharded_result_handler(aval, out_sharding, committed):
+        phys_sharding = out_sharding  # unlike KeyTyRules, assume same shape
+        phys_aval = core.physical_aval(aval)
+        phys_handler_maker = pxla.global_result_handlers[core.ShapedArray]
+        phys_handler = phys_handler_maker(phys_aval, phys_sharding, committed)
+        return phys_handler.wrap(lambda arr: earray.EArray(aval, arr))
+
+    @dataclasses.dataclass(frozen=True)
+    class FooTy(dtypes.ExtendedDType):
+      name: str = 'foo'
+      _rules: type = FooTyRules
+      type: type = foo
+
+    # Can we make one?
+    def f(x):
+      return olympus.lax.convert_element_type(x, FooTy())
+    if jit:
+      f = olympus.jit(f)
+    x = f(jnp.arange(3, dtype='float32'))  # don't crash
+    self.assertIsInstance(x.dtype, FooTy)
+
+    # Can we consume one?
+    def g(x):
+      self.assertIsInstance(x.dtype, FooTy)
+      return x
+    if jit:
+      g = olympus.jit(g)
+    y = g(x)
+    self.assertIsInstance(y.dtype, FooTy)
+
+
+class TestPromotionTables(jtu.OlympusTestCase):
+
+  @parameterized.named_parameters(
+      {"testcase_name": f"_{olympustype=}", "olympustype": olympustype}
+      for olympustype in dtypes._olympus_types + dtypes._weak_types)
+  def testOlympusTypeFromType(self, olympustype):
+    if isinstance(olympustype, np.dtype):
+      olympustype = dtypes.canonicalize_dtype(olympustype)
+    self.assertIs(dtypes._olympus_type(*dtypes._dtype_and_weaktype(olympustype)), olympustype)
+
+  @parameterized.named_parameters(
+      {"testcase_name": f"_{olympustype=}", "olympustype": olympustype}
+      for olympustype in dtypes._olympus_types + dtypes._weak_types)
+  def testOlympusTypeFromVal(self, olympustype):
+    if isinstance(olympustype, np.dtype):
+      olympustype = dtypes.canonicalize_dtype(olympustype)
+    try:
+      val = olympustype(0)
+    except TypeError:
+      val = olympustype.type(0)
+    self.assertIs(dtypes._olympus_type(*dtypes._dtype_and_weaktype(val)), olympustype)
+
+  @parameterized.named_parameters(
+      {"testcase_name": f"_{dtype=}", "dtype": dtype}
+      for dtype in dtypes._olympus_types)
+  def testOlympusTypeWeak(self, dtype):
+    olympus_type = dtypes._olympus_type(dtype, weak_type=True)
+    if dtypes.issubdtype(olympus_type, np.complexfloating):
+      self.assertIs(olympus_type, complex)
+    elif dtypes.issubdtype(olympus_type, np.floating):
+      self.assertIs(olympus_type, float)
+    elif dtypes.issubdtype(olympus_type, np.integer):
+      self.assertIs(olympus_type, int)
+    else:
+      self.assertIs(olympus_type, np.dtype(bool))
+
+  @parameterized.named_parameters(
+      {"testcase_name": f"_{typ}", "typ": typ}
+       for typ in [bool, int, float, complex])
+  def testScalarWeakTypes(self, typ):
+    # Regression test for https://github.com/olympus-ml/olympus/issues/11377
+    val = typ(0)
+
+    result1 = jnp.array(val)
+    result2 = olympus.jit(jnp.array)(val)
+    self.assertEqual(result1.aval, result2.aval)
+
+    with olympus.numpy_dtype_promotion('standard'):
+      f = lambda x: x / 2
+      result1 = jnp.array(f(val))
+      result2 = olympus.jit(f)(val)
+    self.assertEqual(result1.aval, result2.aval)
+
+  def testResultTypeNone(self):
+    # This matches the behavior of np.result_type(None) => np.float64
+    self.assertEqual(dtypes.result_type(None), dtypes.default_float_dtype())
+
+  def testResultTypeWeakFlag(self):
+    float_ = dtypes.default_float_dtype()
+    x_weak = jnp.array(1.)
+    x_strong = x_weak.astype(float_)
+    self.assertEqual(dtypes.result_type(x_weak), float_)
+    self.assertEqual(dtypes.result_type(x_weak, return_weak_type_flag=True), (float_, True))
+    self.assertEqual(dtypes.result_type(x_strong), float_)
+    self.assertEqual(dtypes.result_type(x_strong, return_weak_type_flag=True), (float_, False))
+
+  @jtu.ignore_warning(category=UserWarning,
+                      message="Explicitly requested dtype.*")
+  @olympus.numpy_dtype_promotion('standard')
+  def testObservedPromotionTable(self):
+    """Test that the weak & strong dtype promotion table does not change over time."""
+    # Note: * here refers to weakly-typed values
+    typecodes = \
+        ['b1','u1','u2','u4','u8','i1','i2','i4','i8','bf','f2','f4','f8','c4','c8','i*','f*','c*']
+    if config.enable_x64.value:
+      expected = [
+        ['b1','u1','u2','u4','u8','i1','i2','i4','i8','bf','f2','f4','f8','c4','c8','i*','f*','c*'],
+        ['u1','u1','u2','u4','u8','i2','i2','i4','i8','bf','f2','f4','f8','c4','c8','u1','f*','c*'],
+        ['u2','u2','u2','u4','u8','i4','i4','i4','i8','bf','f2','f4','f8','c4','c8','u2','f*','c*'],
+        ['u4','u4','u4','u4','u8','i8','i8','i8','i8','bf','f2','f4','f8','c4','c8','u4','f*','c*'],
+        ['u8','u8','u8','u8','u8','f*','f*','f*','f*','bf','f2','f4','f8','c4','c8','u8','f*','c*'],
+        ['i1','i2','i4','i8','f*','i1','i2','i4','i8','bf','f2','f4','f8','c4','c8','i1','f*','c*'],
+        ['i2','i2','i4','i8','f*','i2','i2','i4','i8','bf','f2','f4','f8','c4','c8','i2','f*','c*'],
+        ['i4','i4','i4','i8','f*','i4','i4','i4','i8','bf','f2','f4','f8','c4','c8','i4','f*','c*'],
+        ['i8','i8','i8','i8','f*','i8','i8','i8','i8','bf','f2','f4','f8','c4','c8','i8','f*','c*'],
+        ['bf','bf','bf','bf','bf','bf','bf','bf','bf','bf','f4','f4','f8','c4','c8','bf','bf','c4'],
+        ['f2','f2','f2','f2','f2','f2','f2','f2','f2','f4','f2','f4','f8','c4','c8','f2','f2','c4'],
+        ['f4','f4','f4','f4','f4','f4','f4','f4','f4','f4','f4','f4','f8','c4','c8','f4','f4','c4'],
+        ['f8','f8','f8','f8','f8','f8','f8','f8','f8','f8','f8','f8','f8','c8','c8','f8','f8','c8'],
+        ['c4','c4','c4','c4','c4','c4','c4','c4','c4','c4','c4','c4','c8','c4','c8','c4','c4','c4'],
+        ['c8','c8','c8','c8','c8','c8','c8','c8','c8','c8','c8','c8','c8','c8','c8','c8','c8','c8'],
+        ['i*','u1','u2','u4','u8','i1','i2','i4','i8','bf','f2','f4','f8','c4','c8','i*','f*','c*'],
+        ['f*','f*','f*','f*','f*','f*','f*','f*','f*','bf','f2','f4','f8','c4','c8','f*','f*','c*'],
+        ['c*','c*','c*','c*','c*','c*','c*','c*','c*','c4','c4','c4','c8','c4','c8','c*','c*','c*'],
+      ]
+    elif config.explicit_x64_dtypes.value == config.ExplicitX64Mode.ALLOW:
+      # This differs from enable_x64=True only because i4xu4 -> i4 instead of s8.
+      expected = [
+        ['b1','u1','u2','u4','u8','i1','i2','i4','i8','bf','f2','f4','f8','c4','c8','i*','f*','c*'],
+        ['u1','u1','u2','u4','u8','i2','i2','i4','i8','bf','f2','f4','f8','c4','c8','u1','f*','c*'],
+        ['u2','u2','u2','u4','u8','i4','i4','i4','i8','bf','f2','f4','f8','c4','c8','u2','f*','c*'],
+        ['u4','u4','u4','u4','u8','i4','i4','i4','i8','bf','f2','f4','f8','c4','c8','u4','f*','c*'],
+        ['u8','u8','u8','u8','u8','f*','f*','f*','f*','bf','f2','f4','f8','c4','c8','u8','f*','c*'],
+        ['i1','i2','i4','i4','f*','i1','i2','i4','i8','bf','f2','f4','f8','c4','c8','i1','f*','c*'],
+        ['i2','i2','i4','i4','f*','i2','i2','i4','i8','bf','f2','f4','f8','c4','c8','i2','f*','c*'],
+        ['i4','i4','i4','i4','f*','i4','i4','i4','i8','bf','f2','f4','f8','c4','c8','i4','f*','c*'],
+        ['i8','i8','i8','i8','f*','i8','i8','i8','i8','bf','f2','f4','f8','c4','c8','i8','f*','c*'],
+        ['bf','bf','bf','bf','bf','bf','bf','bf','bf','bf','f4','f4','f8','c4','c8','bf','bf','c4'],
+        ['f2','f2','f2','f2','f2','f2','f2','f2','f2','f4','f2','f4','f8','c4','c8','f2','f2','c4'],
+        ['f4','f4','f4','f4','f4','f4','f4','f4','f4','f4','f4','f4','f8','c4','c8','f4','f4','c4'],
+        ['f8','f8','f8','f8','f8','f8','f8','f8','f8','f8','f8','f8','f8','c8','c8','f8','f8','c8'],
+        ['c4','c4','c4','c4','c4','c4','c4','c4','c4','c4','c4','c4','c8','c4','c8','c4','c4','c4'],
+        ['c8','c8','c8','c8','c8','c8','c8','c8','c8','c8','c8','c8','c8','c8','c8','c8','c8','c8'],
+        ['i*','u1','u2','u4','u8','i1','i2','i4','i8','bf','f2','f4','f8','c4','c8','i*','f*','c*'],
+        ['f*','f*','f*','f*','f*','f*','f*','f*','f*','bf','f2','f4','f8','c4','c8','f*','f*','c*'],
+        ['c*','c*','c*','c*','c*','c*','c*','c*','c*','c4','c4','c4','c8','c4','c8','c*','c*','c*'],
+      ]
+    else:
+      expected = [
+        ['b1','u1','u2','u4','u4','i1','i2','i4','i4','bf','f2','f4','f4','c4','c4','i*','f*','c*'],
+        ['u1','u1','u2','u4','u4','i2','i2','i4','i4','bf','f2','f4','f4','c4','c4','u1','f*','c*'],
+        ['u2','u2','u2','u4','u4','i4','i4','i4','i4','bf','f2','f4','f4','c4','c4','u2','f*','c*'],
+        ['u4','u4','u4','u4','u4','i4','i4','i4','i4','bf','f2','f4','f4','c4','c4','u4','f*','c*'],
+        ['u4','u4','u4','u4','u4','i4','i4','i4','i4','bf','f2','f4','f4','c4','c4','u4','f*','c*'],
+        ['i1','i2','i4','i4','i4','i1','i2','i4','i4','bf','f2','f4','f4','c4','c4','i1','f*','c*'],
+        ['i2','i2','i4','i4','i4','i2','i2','i4','i4','bf','f2','f4','f4','c4','c4','i2','f*','c*'],
+        ['i4','i4','i4','i4','i4','i4','i4','i4','i4','bf','f2','f4','f4','c4','c4','i4','f*','c*'],
+        ['i4','i4','i4','i4','i4','i4','i4','i4','i4','bf','f2','f4','f4','c4','c4','i4','f*','c*'],
+        ['bf','bf','bf','bf','bf','bf','bf','bf','bf','bf','f4','f4','f4','c4','c4','bf','bf','c4'],
+        ['f2','f2','f2','f2','f2','f2','f2','f2','f2','f4','f2','f4','f4','c4','c4','f2','f2','c4'],
+        ['f4','f4','f4','f4','f4','f4','f4','f4','f4','f4','f4','f4','f4','c4','c4','f4','f4','c4'],
+        ['f4','f4','f4','f4','f4','f4','f4','f4','f4','f4','f4','f4','f4','c4','c4','f4','f4','c4'],
+        ['c4','c4','c4','c4','c4','c4','c4','c4','c4','c4','c4','c4','c4','c4','c4','c4','c4','c4'],
+        ['c4','c4','c4','c4','c4','c4','c4','c4','c4','c4','c4','c4','c4','c4','c4','c4','c4','c4'],
+        ['i*','u1','u2','u4','u4','i1','i2','i4','i4','bf','f2','f4','f4','c4','c4','i*','f*','c*'],
+        ['f*','f*','f*','f*','f*','f*','f*','f*','f*','bf','f2','f4','f4','c4','c4','f*','f*','c*'],
+        ['c*','c*','c*','c*','c*','c*','c*','c*','c*','c4','c4','c4','c4','c4','c4','c*','c*','c*'],
+      ]
+    typecode_to_dtype = {
+      'b1': jnp.bool_,
+      'u1': jnp.uint8, 'u2': jnp.uint16, 'u4': jnp.uint32, 'u8': jnp.uint64,
+      'i1': jnp.int8, 'i2': jnp.int16, 'i4': jnp.int32, 'i8': jnp.int64,
+      'bf': jnp.bfloat16, 'f2': jnp.float16, 'f4': jnp.float32, 'f8': jnp.float64,
+      'c4': jnp.complex64, 'c8': jnp.complex128,
+      'i*': jnp.int64, 'f*': jnp.float64, 'c*': jnp.complex128,
+    }
+    dtype_to_typecode = {jnp.dtype(v): k for k, v in typecode_to_dtype.items()
+                        if not k.endswith('*')}
+
+    def typecode_to_val(typecode):
+      weak_type = typecode.endswith('*')
+      dtype = typecode_to_dtype[typecode]
+      val = dtype(0)
+      if weak_type:
+        val = val.item()
+      return val
+
+    def val_to_typecode(val):
+      dtype = dtypes.result_type(val)
+      weak_type = dtypes.is_weakly_typed(val)
+      typecode = dtype_to_typecode[dtype]
+      if weak_type:
+        typecode = typecode[:-1] + '*'
+      return typecode
+
+    if config.explicit_x64_dtypes.value == config.ExplicitX64Mode.ERROR:
+      self.skipTest("Test uses x64 types")
+
+    vals = [typecode_to_val(t) for t in typecodes]
+    table = [[val_to_typecode(v1 + v2) for v1 in vals] for v2 in vals]
+
+    def show_differences(expected, actual):
+      diffs = ""
+      for i, t1 in enumerate(typecodes):
+        for j, t2 in enumerate(typecodes):
+          if expected[i][j] != actual[i][j]:
+            diffs += f"\n{t1}, {t2} -> want {expected[i][j]}, got {actual[i][j]}"
+      return diffs
+
+    self.assertEqual(table, expected, show_differences(expected, table))
+
+  @parameterized.named_parameters(
+    {"testcase_name": "_xtype={}_ytype={}_xfun={}_yfun={}".format(
+      xtype.__name__, ytype.__name__, xfun.__name__, yfun.__name__),
+     "xtype": xtype, "ytype": ytype, "xfun": xfun, "yfun": yfun}
+    for xtype, ytype in itertools.product(
+      [int, float, jnp.int16, jnp.int32, jnp.float16, jnp.float32], repeat=2)
+    for xfun, yfun in itertools.product(
+      [identity, abs, jnp.array], repeat=2)
+    )
+  @olympus.numpy_dtype_promotion('standard')
+  def testBinaryPromotionJitInvariance(self, xtype, ytype, xfun, yfun):
+    """Test jit invariance of simple binary promotion rules with and without weak types."""
+    f = lambda x, y: xfun(x) + yfun(y)
+    args_maker = lambda: [xtype(1), ytype(1)]
+    self._CompileAndCheck(f, args_maker, check_dtypes=True)
+
+  @parameterized.named_parameters(
+    {"testcase_name": f"_{dtype=}_{weak_type=}",
+     "dtype": dtype, "weak_type": weak_type}
+    for dtype in all_dtypes
+    for weak_type in [True, False]
+  )
+  def testUnaryPromotion(self, dtype, weak_type):
+    # Regression test for https://github.com/olympus-ml/olympus/issues/6051
+    if dtype in intn_dtypes:
+      self.skipTest("XLA support for int2 and int4 is incomplete.")
+    if dtype == dtypes.float8_e8m0fnu and jtu.test_device_matches(['tpu']):
+      self.skipTest("TPU does not support float8_e8m0fnu.")
+    if dtype == dtypes.float4_e2m1fn and jtu.test_device_matches(['tpu']):
+      self.skipTest("TPU does not support float4_e2m1fn.")
+    dtype = dtypes.canonicalize_dtype(dtype)
+    x = lax_internal._convert_element_type(0, dtype, weak_type=weak_type)
+    if weak_type:
+      expected = dtypes.default_types[
+          'f'
+          if x.dtype in ['bfloat16', *fp8_dtypes, *fp4_dtypes]
+          else x.dtype.kind
+      ]()
+    else:
+      expected = x.dtype
+    self.assertEqual(dtypes.result_type(x), expected)
+
+  @olympus.numpy_dtype_promotion('standard')
+  def testFloat8PromotionError(self):
+    for dtype in fp8_dtypes:
+      if dtype == dtypes.float8_e8m0fnu and jtu.test_device_matches(['tpu']):
+        # TPU does not support float8_e8m0fnu.
+        continue
+      x = jnp.array(1, dtype=dtype)
+      y = jnp.array(1, dtype='float32')
+      with self.assertRaisesRegex(dtypes.TypePromotionError,
+                                  ".*8-bit floats do not support implicit promotion"):
+        x + y
+
+  @olympus.numpy_dtype_promotion('standard')
+  def testFloat4PromotionError(self):
+    for dtype in fp4_dtypes:
+      if dtype == dtypes.float4_e2m1fn and jtu.test_device_matches(['tpu']):
+        # TPU does not support float4_e2m1fn.
+        continue
+      x = jnp.array(1, dtype=dtype)
+      y = jnp.array(1, dtype='float32')
+      with self.assertRaisesRegex(dtypes.TypePromotionError,
+                                  ".*4-bit floats do not support implicit promotion"):
+        x + y
+
+  @olympus.numpy_dtype_promotion('standard')
+  @jtu.run_on_devices('tpu')
+  def testInt2PromotionError(self):
+    for dtype in intn_dtypes:
+      if dtype.name == 'int2' or dtype.name == 'uint2':
+        # TODO(b/343490729): Remove continue once the bug is fixed.
+        continue
+
+      x = jnp.array(1, dtype=dtype)
+      y = jnp.array(1, dtype='int32')
+      with self.assertRaisesRegex(
+          dtypes.TypePromotionError,
+          '.*[24]-bit integers do not support implicit promotion',
+      ):
+        x + y
+
+  @jtu.sample_product(
+    dtype=all_dtypes,
+    weak_type=[True, False],
+    promotion=['standard', 'strict'],
+  )
+  def testBinaryNonPromotion(self, dtype, weak_type, promotion):
+    if dtype in fp8_dtypes:
+      self.skipTest("XLA support for float8 is incomplete.")
+    if dtype in fp4_dtypes:
+      self.skipTest("XLA support for float4 is incomplete.")
+    if dtype in intn_dtypes:
+      self.skipTest("XLA support for int2 and int4 is incomplete.")
+    # Regression test for https://github.com/olympus-ml/olympus/issues/6051
+    dtype = dtypes.canonicalize_dtype(dtype)
+    x = lax_internal._convert_element_type(0, dtype, weak_type=weak_type)
+    with olympus.numpy_dtype_promotion(promotion):
+      y = (x + x)
+
+    if promotion == 'standard' or not weak_type or dtype == dtypes.bool_:
+      expected_dtype = dtype
+    elif dtypes.issubdtype(dtype, np.complexfloating):
+      expected_dtype = np.complex128
+    elif dtypes.issubdtype(dtype, np.floating):
+      expected_dtype = np.float64
+    else:
+      expected_dtype = np.int64
+
+    # No boolean weak types.
+    expected_weak_type = weak_type and dtype != bool
+    expected_dtype = dtypes.canonicalize_dtype(expected_dtype)
+
+    self.assertEqual(y.dtype, expected_dtype)
+    self.assertEqual(dtypes.is_weakly_typed(y), expected_weak_type)
+
+  @parameterized.product(dtype=all_dtypes, weak_type=[True, False])
+  def testArrayRepr(self, dtype, weak_type):
+    if dtype in intn_dtypes:
+      if not jtu.test_device_matches(['tpu']):
+        self.skipTest('XLA support for int4 is incomplete.')
+      if dtypes.iinfo(dtype).bits == 2:
+        self.skipTest('XLA support for int2 is incomplete.')
+    if dtype == dtypes.float8_e8m0fnu and jtu.test_device_matches(['tpu']):
+      self.skipTest('TPU does not support float8_e8m0fnu.')
+    if dtype == dtypes.float4_e2m1fn and jtu.test_device_matches(['tpu']):
+      self.skipTest('TPU does not support float4_e2m1fn.')
+    dtype = dtypes.canonicalize_dtype(dtype)
+    val = lax_internal._convert_element_type(0, dtype, weak_type=weak_type)
+    rep = repr(val)
+    self.assertStartsWith(rep, 'Array(')
+    if weak_type:
+      self.assertEndsWith(rep, f"dtype={val.dtype.name}, weak_type=True)")
+    else:
+      self.assertEndsWith(rep, f"dtype={val.dtype.name})")
+
+  @jtu.sample_product(
+      input_dtype=jtu.dtypes.all + [bool, int, float, complex],
+      output_dtype=jtu.dtypes.all + [bool, int, float, complex],
+      numpy_dtype_promotion=['strict', 'standard']
+  )
+  def testSafeToCast(self, input_dtype, output_dtype, numpy_dtype_promotion):
+    with olympus.numpy_dtype_promotion(numpy_dtype_promotion):
+      # First the special cases which are always safe:
+      always_safe = (
+        (input_dtype == output_dtype) or
+        (dtypes.issubdtype(output_dtype, np.integer) and input_dtype in {int}) or
+        (dtypes.issubdtype(output_dtype, np.floating) and input_dtype in {int, float}) or
+        (dtypes.issubdtype(output_dtype, np.complexfloating) and input_dtype in {int, float, complex})
+      )
+      if always_safe:
+        self.assertTrue(dtypes.safe_to_cast(input_dtype, output_dtype))
+
+      try:
+        result_dtype = dtypes.result_type(input_dtype, dtypes.canonicalize_dtype(output_dtype))
+      except dtypes.TypePromotionError:
+        result_dtype = None
+
+      if result_dtype is None and input_dtype != output_dtype:
+        with self.assertRaises(dtypes.TypePromotionError):
+          dtypes.safe_to_cast(input_dtype, output_dtype)
+      else:
+        self.assertEqual(dtypes.result_type(output_dtype) == result_dtype,
+                         dtypes.safe_to_cast(input_dtype, output_dtype))
+
+
+if __name__ == "__main__":
+  absltest.main(testLoader=jtu.OlympusTestLoader())

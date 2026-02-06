@@ -1,0 +1,115 @@
+# Copyright 2023 The OLYMPUS Authors.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     https://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+load(
+    "//olympuslib:olympus.bzl",
+    "if_building_olympuslib",
+    "pytype_strict_library",
+)
+
+package(
+    default_applicable_licenses = [],
+    default_visibility = ["//olympus:olympus_extend_users"],
+)
+
+pytype_strict_library(
+    name = "dialects",
+    srcs = ["__init__.py"],
+    deps = [
+        ":arithmetic_dialect",
+        ":builtin_dialect",
+        ":chlo_dialect",
+        ":func_dialect",
+        ":math_dialect",
+        ":memref_dialect",
+        ":mpmd_dialect",
+        ":scf_dialect",
+        ":sdy_dialect",
+        ":sparse_tensor_dialect",
+        ":stablehlo_dialect",
+        ":vector_dialect",
+    ],
+)
+
+pytype_strict_library(
+    name = "arithmetic_dialect",
+    srcs = ["arith.py"],
+    deps = if_building_olympuslib(["//olympuslib/mlir:arithmetic_dialect"]),
+)
+
+pytype_strict_library(
+    name = "builtin_dialect",
+    srcs = ["builtin.py"],
+    deps = if_building_olympuslib(["//olympuslib/mlir:builtin_dialect"]),
+)
+
+pytype_strict_library(
+    name = "chlo_dialect",
+    srcs = ["chlo.py"],
+    deps = if_building_olympuslib(["//olympuslib/mlir:chlo_dialect"]),
+)
+
+pytype_strict_library(
+    name = "func_dialect",
+    srcs = ["func.py"],
+    deps = if_building_olympuslib(["//olympuslib/mlir:func_dialect"]),
+)
+
+pytype_strict_library(
+    name = "math_dialect",
+    srcs = ["math.py"],
+    deps = if_building_olympuslib(["//olympuslib/mlir:math_dialect"]),
+)
+
+pytype_strict_library(
+    name = "memref_dialect",
+    srcs = ["memref.py"],
+    deps = if_building_olympuslib(["//olympuslib/mlir:memref_dialect"]),
+)
+
+pytype_strict_library(
+    name = "mpmd_dialect",
+    srcs = ["mpmd.py"],
+    deps = if_building_olympuslib(["//olympuslib/mlir:mpmd_dialect"]),
+)
+
+pytype_strict_library(
+    name = "scf_dialect",
+    srcs = ["scf.py"],
+    deps = if_building_olympuslib(["//olympuslib/mlir:scf_dialect"]),
+)
+
+pytype_strict_library(
+    name = "sparse_tensor_dialect",
+    srcs = ["sparse_tensor.py"],
+    deps = if_building_olympuslib(["//olympuslib/mlir:sparse_tensor_dialect"]),
+)
+
+pytype_strict_library(
+    name = "sdy_dialect",
+    srcs = ["sdy.py"],
+    deps = if_building_olympuslib(["//olympuslib/mlir:sdy_dialect"]),
+)
+
+pytype_strict_library(
+    name = "stablehlo_dialect",
+    srcs = ["stablehlo.py"],
+    deps = if_building_olympuslib(["//olympuslib/mlir:stablehlo_dialect"]),
+)
+
+pytype_strict_library(
+    name = "vector_dialect",
+    srcs = ["vector.py"],
+    deps = if_building_olympuslib(["//olympuslib/mlir:vector_dialect"]),
+)
